@@ -3,6 +3,22 @@
 #include "sima/builder/Node.h"
 #include "sima/pipeline/PipelineOptions.h"
 #include "sima/pipeline/TapStream.h"
+#include "sima/nodes/common/AppSink.h"
+#include "sima/nodes/common/Caps.h"
+#include "sima/nodes/common/DebugPoint.h"
+#include "sima/nodes/common/FileSrc.h"
+#include "sima/nodes/common/JpegDec.h"
+#include "sima/nodes/common/QtDemuxVideoPad.h"
+#include "sima/nodes/common/Queue.h"
+#include "sima/nodes/common/VideoConvert.h"
+#include "sima/nodes/common/VideoScale.h"
+#include "sima/nodes/io/AppSrcImage.h"
+#include "sima/nodes/io/RTSPInput.h"
+#include "sima/nodes/rtp/RtpH264Depay.h"
+#include "sima/nodes/sima/H264DecodeSima.h"
+#include "sima/nodes/sima/H264EncodeSima.h"
+#include "sima/nodes/sima/H264Parse.h"
+#include "sima/nodes/sima/RtpH264Pay.h"
 
 #include <memory>
 #include <string>

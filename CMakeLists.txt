@@ -22,12 +22,19 @@ pkg_check_modules(GST REQUIRED
 pkg_check_modules(OPENCV REQUIRED opencv4)
 
 add_library(pipelinesession STATIC
-  src/PipelineSession.cpp
+  old_PipelineSession.cpp
+  src/pipeline/PipelineSession.cpp
+  src/pipeline/Errors.cpp
+  src/pipeline/PipelineReport.cpp
+  src/pipeline/TapStream.cpp
+  src/gst/GstBusWatch.cpp
+  src/nodes/common/AppSink.cpp
 )
 
 target_include_directories(pipelinesession
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/pipeline
     ${GST_INCLUDE_DIRS}
     ${OPENCV_INCLUDE_DIRS}
 )

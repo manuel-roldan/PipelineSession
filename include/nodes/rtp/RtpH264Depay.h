@@ -16,4 +16,5 @@ public:
 
 namespace sima::nodes {
 std::shared_ptr<sima::Node> RtpH264Depay();
+std::shared_ptr<sima::Node> H264DepayParse();
 } // namespace sima::nodes
