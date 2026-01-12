@@ -22,13 +22,43 @@ pkg_check_modules(GST REQUIRED
 pkg_check_modules(OPENCV REQUIRED opencv4)
 
 add_library(pipelinesession STATIC
-  old_PipelineSession.cpp
   src/pipeline/PipelineSession.cpp
   src/pipeline/Errors.cpp
   src/pipeline/PipelineReport.cpp
   src/pipeline/TapStream.cpp
+  src/pipeline/FrameStream.cpp
+  src/pipeline/TensorTypes.cpp
+  src/pipeline/TensorStream.cpp
+  src/pipeline/TensorUtil.cpp
+  src/pipeline/internal/GstDiagnosticsUtil.cpp
   src/gst/GstBusWatch.cpp
+  src/gst/GstInit.cpp
+  src/gst/GstHelpers.cpp
+  src/gst/GstParseLaunch.cpp
+  src/gst/GstPadTap.cpp
+  src/gst/GstIntrospection.cpp
   src/nodes/common/AppSink.cpp
+  src/nodes/common/Caps.cpp
+  src/nodes/common/DebugPoint.cpp
+  src/nodes/common/FileSrc.cpp
+  src/nodes/common/JpegDec.cpp
+  src/nodes/common/QtDemuxVideoPad.cpp
+  src/nodes/common/Queue.cpp
+  src/nodes/common/VideoConvert.cpp
+  src/nodes/common/VideoScale.cpp
+  src/nodes/common/VideoRate.cpp
+  src/nodes/common/ImageFreeze.cpp
+  src/nodes/common/ImageDecode.cpp
+  src/nodes/io/RTSPInput.cpp
+  src/nodes/io/AppSrcImage.cpp
+  src/nodes/rtp/RtpH264Depay.cpp
+  src/nodes/sima/H264DecodeSima.cpp
+  src/nodes/sima/H264EncodeSima.cpp
+  src/nodes/sima/H264Parse.cpp
+  src/nodes/sima/RtpH264Pay.cpp
+  src/nodes/groups/ImageInputGroup.cpp
+  src/nodes/groups/VideoInputGroup.cpp
+  src/nodes/groups/RtspInputGroup.cpp
 )
 
 target_include_directories(pipelinesession
@@ -55,6 +85,42 @@ target_link_libraries(file_read_test PRIVATE pipelinesession)
 add_executable(encoding_decoding_test tests/encoding_decoding_test.cpp)
 target_link_libraries(encoding_decoding_test PRIVATE pipelinesession)
 
+add_executable(unit_builder_test tests/unit_builder_test.cpp)
+target_link_libraries(unit_builder_test PRIVATE pipelinesession)
+
+add_executable(unit_contracts_test tests/unit_contracts_test.cpp)
+target_link_libraries(unit_contracts_test PRIVATE pipelinesession)
+
+add_executable(unit_nodes_test tests/unit_nodes_test.cpp)
+target_link_libraries(unit_nodes_test PRIVATE pipelinesession)
+
+add_executable(unit_gst_helpers_test tests/unit_gst_helpers_test.cpp)
+target_link_libraries(unit_gst_helpers_test PRIVATE pipelinesession)
+
+add_executable(unit_framestream_test tests/unit_framestream_test.cpp)
+target_link_libraries(unit_framestream_test PRIVATE pipelinesession)
+
+add_executable(unit_tapstream_test tests/unit_tapstream_test.cpp)
+target_link_libraries(unit_tapstream_test PRIVATE pipelinesession)
+
+add_executable(run_debug_test tests/run_debug_test.cpp)
+target_link_libraries(run_debug_test PRIVATE pipelinesession)
+
+add_executable(unit_appsrcimage_test tests/unit_appsrcimage_test.cpp)
+target_link_libraries(unit_appsrcimage_test PRIVATE pipelinesession)
+
+add_executable(unit_groups_test tests/unit_groups_test.cpp)
+target_link_libraries(unit_groups_test PRIVATE pipelinesession)
+
+add_executable(unit_image_group_runtime_test tests/unit_image_group_runtime_test.cpp)
+target_link_libraries(unit_image_group_runtime_test PRIVATE pipelinesession)
+
+add_executable(unit_tensorstream_test tests/unit_tensorstream_test.cpp)
+target_link_libraries(unit_tensorstream_test PRIVATE pipelinesession)
+
+add_executable(unit_pipeline_io_test tests/unit_pipeline_io_test.cpp)
+target_link_libraries(unit_pipeline_io_test PRIVATE pipelinesession)
+
 enable_testing()
 
 # Your repo has test.jpg in the root (per your ls)
@@ -68,4 +134,52 @@ add_test(NAME file_read_test
 
 add_test(NAME encoding_decoding_test
   COMMAND encoding_decoding_test ${CMAKE_SOURCE_DIR}/test.jpg
+)
+
+add_test(NAME unit_builder_test
+  COMMAND unit_builder_test
+)
+
+add_test(NAME unit_contracts_test
+  COMMAND unit_contracts_test
+)
+
+add_test(NAME unit_nodes_test
+  COMMAND unit_nodes_test
+)
+
+add_test(NAME unit_gst_helpers_test
+  COMMAND unit_gst_helpers_test
+)
+
+add_test(NAME unit_framestream_test
+  COMMAND unit_framestream_test
+)
+
+add_test(NAME unit_tapstream_test
+  COMMAND unit_tapstream_test
+)
+
+add_test(NAME run_debug_test
+  COMMAND run_debug_test
+)
+
+add_test(NAME unit_appsrcimage_test
+  COMMAND unit_appsrcimage_test ${CMAKE_SOURCE_DIR}/test.jpg
+)
+
+add_test(NAME unit_groups_test
+  COMMAND unit_groups_test
+)
+
+add_test(NAME unit_image_group_runtime_test
+  COMMAND unit_image_group_runtime_test ${CMAKE_SOURCE_DIR}/test.jpg
+)
+
+add_test(NAME unit_tensorstream_test
+  COMMAND unit_tensorstream_test ${CMAKE_SOURCE_DIR}/test.jpg
+)
+
+add_test(NAME unit_pipeline_io_test
+  COMMAND unit_pipeline_io_test ${CMAKE_SOURCE_DIR}/test.jpg
 )

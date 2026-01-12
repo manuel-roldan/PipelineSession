@@ -59,7 +59,11 @@ public:
   // --------------------------
 
   /// Print a linear NodeGroup in deterministic index order (0..N-1).
-  static std::string to_text(const NodeGroup& group, const Options& opt = {}) {
+  static std::string to_text(const NodeGroup& group) {
+    return to_text(group, Options{});
+  }
+
+  static std::string to_text(const NodeGroup& group, const Options& opt) {
     std::ostringstream oss;
     const auto& nodes = group.nodes();
 
@@ -89,7 +93,11 @@ public:
   // --------------------------
 
   /// Produce a DOT digraph for Graphviz.
-  static std::string to_dot(const Graph& g, const Options& opt = {}) {
+  static std::string to_dot(const Graph& g) {
+    return to_dot(g, Options{});
+  }
+
+  static std::string to_dot(const Graph& g, const Options& opt) {
     std::ostringstream oss;
 
     oss << "digraph " << dot_id_(opt.dot_graph_name) << " {\n";
@@ -130,7 +138,11 @@ public:
   // --------------------------
 
   /// Produce a Mermaid flowchart (useful in Markdown/Confluence).
-  static std::string to_mermaid(const Graph& g, const Options& opt = {}) {
+  static std::string to_mermaid(const Graph& g) {
+    return to_mermaid(g, Options{});
+  }
+
+  static std::string to_mermaid(const Graph& g, const Options& opt) {
     std::ostringstream oss;
     oss << "flowchart " << (opt.mermaid_lr ? "LR" : "TD") << "\n";
 

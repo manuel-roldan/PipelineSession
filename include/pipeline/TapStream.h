@@ -1,3 +1,4 @@
+// include/sima/pipeline/TapStream.h
 #pragma once
 
 #include "sima/pipeline/PipelineReport.h"
@@ -62,83 +63,6 @@ struct TapPacket {
 };
 
 // =============================
-// Data types (legacy typed frame)
-// =============================
-struct FrameNV12 {
-  int width = 0;
-  int height = 0;
-  bool keyframe = false;
-
-  int64_t pts_ns = -1;
-  int64_t dts_ns = -1;
-  int64_t duration_ns = -1;
-
-  std::vector<uint8_t> nv12; // tightly packed: w*h Y + w*h/2 UV
-};
-
-// =============================
-// Zero-copy view (fast path default)
-// =============================
-struct FrameNV12Ref {
-  int width = 0;
-  int height = 0;
-  bool keyframe = false;
-
-  int64_t pts_ns = -1;
-  int64_t dts_ns = -1;
-  int64_t duration_ns = -1;
-
-  // NV12 planes (strided)
-  const uint8_t* y = nullptr;
-  const uint8_t* uv = nullptr;
-  int y_stride = 0;
-  int uv_stride = 0;
-
-  std::string caps_string;
-  std::shared_ptr<void> holder; // opaque RAII (unmaps + unrefs sample)
-};
-
-// =============================
-// FrameStream (appsink wrapper)
-// =============================
-class FrameStream {
-public:
-  FrameStream() = default;
-  FrameStream(GstElement* pipeline, GstElement* appsink);
-  ~FrameStream();
-
-  FrameStream(const FrameStream&) = delete;
-  FrameStream& operator=(const FrameStream&) = delete;
-
-  FrameStream(FrameStream&&) noexcept;
-  FrameStream& operator=(FrameStream&&) noexcept;
-
-  // Fast path (default): returns a strided NV12 view with ref-counted lifetime.
-  std::optional<FrameNV12Ref> next(int timeout_ms = 1000);
-
-  // Convenience: tight packed copy (legacy).
-  std::optional<FrameNV12> next_copy(int timeout_ms = 1000);
-
-  void close();
-
-  const std::string& debug_pipeline() const { return debug_pipeline_; }
-
-  // Snapshot report at any time (cheap by default; heavy adds caps/dot if enabled).
-  PipelineReport report_snapshot(bool heavy = false) const;
-
-private:
-  friend class PipelineSession;
-  void set_debug_pipeline(std::string s) { debug_pipeline_ = std::move(s); }
-  void set_diag(std::shared_ptr<void> diag) { diag_ = std::move(diag); }
-
-  GstElement* pipeline_ = nullptr; // owned ref
-  GstElement* appsink_ = nullptr;  // owned ref
-  std::string debug_pipeline_;
-
-  std::shared_ptr<void> diag_; // opaque diagnostics context
-};
-
-// =============================
 // TapStream (generic appsink wrapper)
 // =============================
 class TapStream {
@@ -173,7 +97,7 @@ private:
   GstElement* appsink_ = nullptr;  // owned ref
   std::string debug_pipeline_;
 
-  std::shared_ptr<void> diag_;
+  std::shared_ptr<void> diag_; // opaque diagnostics context (pipeline_internal::DiagCtx)
   int tap_node_index_ = -1;
   std::string tap_sink_name_;
 };

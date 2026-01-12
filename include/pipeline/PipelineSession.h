@@ -1,8 +1,12 @@
 #pragma once
 
 #include "sima/builder/Node.h"
+#include "sima/builder/NodeGroup.h"
 #include "sima/pipeline/PipelineOptions.h"
 #include "sima/pipeline/TapStream.h"
+#include "sima/pipeline/FrameStream.h"
+#include "sima/pipeline/TensorStream.h"
+#include "sima/builder/GraphPrinter.h"
 #include "sima/nodes/common/AppSink.h"
 #include "sima/nodes/common/Caps.h"
 #include "sima/nodes/common/DebugPoint.h"
@@ -53,12 +57,15 @@ class PipelineSession {
 public:
   // Core: add a node (factory functions return std::shared_ptr<Node>)
   PipelineSession& add(std::shared_ptr<Node> node);
+  PipelineSession& add(const NodeGroup& group);
+  PipelineSession& add(NodeGroup&& group);
 
   // Explicit raw-string escape hatch (keeps "power user" obvious)
   PipelineSession& gst(std::string fragment);
 
   // Typed runner: last node must be OutputAppSink() and negotiated into NV12.
   FrameStream run();
+  TensorStream run_tensor();
 
   // Split at DebugPoint(point_name), ignore nodes after it, attach appsink and return TapStream.
   TapStream run_tap(const std::string& point_name);
@@ -71,6 +78,20 @@ public:
 
   // Run once, pull 1 frame (copy) with full structured report.
   RunDebugResult run_debug(const RunDebugOptions& opt = {});
+
+  // Tensor-friendly output helper (adds convert/scale/caps + OutputAppSink).
+  PipelineSession& add_output_tensor(const OutputTensorOptions& opt = {});
+  PipelineSession& add_output_torch(const OutputTensorOptions& opt = {});
+  PipelineSession& add_output_numpy(const OutputTensorOptions& opt = {});
+  PipelineSession& add_output_tensorflow(const OutputTensorOptions& opt = {});
+
+  // UX helpers: builder-only view and gst-launch string.
+  std::string describe(const GraphPrinter::Options& opt = {}) const;
+  std::string to_gst(bool insert_boundaries = false) const;
+
+  // Save/load pipeline config for reproducible runs.
+  void save(const std::string& path) const;
+  static PipelineSession load(const std::string& path);
 
   const std::string& last_pipeline() const { return last_pipeline_; }
 

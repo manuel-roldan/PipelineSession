@@ -1,727 +1,462 @@
-What do you think about this that the other chat gave me? How could I provide this context to Codex?
+# Repository Architecture & Design
 
-## (A) Architecture explanation (deep + structured)
+This repository is a **C++17 library for building, validating, running, and debugging GStreamer pipelines** using a stable, composable API. It provides a higher-level “pipeline-as-code” interface while keeping GStreamer’s power and flexibility, with ML-friendly outputs (tensors) and reproducible configs.
 
-### 1) What this framework is
+The guiding idea is:
 
-This is a **C++17 library for building, validating, running, and debugging GStreamer pipelines** with a stable, composable API.
-
-It has three “faces”:
-
-1. **Builder / Graph API**
-
-   * Users assemble a pipeline as a sequence/graph of typed `Node`s (e.g., `RTSPInput`, `H264DecodeSima`, `CapsNV12SysMem`, `OutputAppSink`).
-   * Nodes generate deterministic GStreamer fragments (and deterministic element names).
-
-2. **Runtime API (PipelineSession)**
-
-   * Turns a Node list into a `gst_parse_launch()` pipeline, manages lifecycle, enforces contracts, and exposes convenient frame/tap streams (`FrameStream`, `TapStream`).
-
-3. **Debug/Validation/RTSP utilities**
-
-   * Validation without playing, debug taps at named points, boundary probes, bus capture, DOT dumps, and an RTSP server mode.
-
-**Who uses it**
-
-* Internal and external developers who want to:
-
-  * Quickly run a pipeline and pull frames in C++ (without writing raw GStreamer boilerplate).
-  * Validate pipeline integrity and contracts in CI.
-  * Debug “where it stalls” in real deployments.
-  * Serve a media pipeline over RTSP (e.g., image → NV12 → encoder → payloader).
-
-**Primary use-cases**
-
-* **Decode / ingest**: File or RTSP → demux/parse → decode → convert/caps → appsink → C++ consumer.
-* **Tap/debug**: Add `DebugPoint("X")` and `run_tap("X")` to pull raw bytes or tight-packed frames at that boundary.
-* **Validate**: `validate()` builds and prerolls (PAUSED) to catch negotiation issues early.
-* **Serve RTSP**: `run_rtsp()` runs a GLib loop in a thread and uses `appsrc` to push generated NV12 frames into the pipeline exposed at a mount.
+> **Typed, deterministic building blocks (Nodes) → a reproducible GStreamer launch string → a managed runtime (PipelineSession) with strong diagnostics (PipelineReport).**
 
 ---
 
-### 2) Runtime model
+## What this library is for
 
-#### Initialization
+### Primary users
+Developers who want to:
+- Assemble pipelines from reusable building blocks (without writing raw GStreamer boilerplate)
+- Validate pipelines early (CI-friendly) and understand failures quickly
+- Run pipelines and consume frames in C++ via `appsink`
+- Tap/debug intermediate points in a pipeline (including per-tap tensor snapshots)
+- Optionally serve a pipeline over RTSP (via `gst-rtsp-server`)
+- Feed ML code via tensor-friendly outputs without writing GStreamer plumbing
 
-* `gst_init_once()` is the single entry-point for GStreamer global init (thread-safe `std::call_once`).
-* Introspection helpers (`element_exists` / `require_element`) ensure required plugins are installed before launching.
-
-**Policy**: *every public runtime entry* calls `gst_init_once()` (e.g., `run()`, `run_tap()`, `validate()`, `run_rtsp()`).
-
-#### Pipeline lifecycle (client-run pipelines)
-
-1. User builds `PipelineSession` by calling `add(...)` / `nodes::...`.
-
-2. `PipelineSession::run()`:
-
-   * Enforces “sink last” contract (must end in `OutputAppSink` for `run()`).
-   * Builds pipeline string (optionally inserting boundary `identity` elements between nodes).
-   * `gst_parse_launch(...)` creates a bin/pipeline.
-   * Optionally enforces element naming contract.
-   * Attaches optional boundary probes (opt-in via env).
-   * Locates appsink by deterministic name (`mysink`).
-   * Sets state to `PLAYING` and returns `FrameStream`.
-
-3. `FrameStream::next(...)`:
-
-   * Pulls samples from appsink using a sliced polling loop.
-   * Drains bus and throws if any error is observed.
-   * Maps buffers into a **zero-copy NV12 view** (`FrameNV12Ref`) or produces a copy (`FrameNV12`).
-
-4. Teardown:
-
-   * `FrameStream::close()` unrefs the appsink and stops/unrefs the pipeline using `stop_and_unref()`.
-   * `stop_and_unref()` is intentionally defensive: state transitions can deadlock in buggy plugins; it performs teardown async and leaks on timeout to avoid hanging the process/CI.
-
-#### Threading model
-
-* **GStreamer internal threads**: the pipeline uses internal streaming threads for decoding, scheduling, etc.
-* **User thread**: the caller thread does:
-
-  * appsink polling (`gst_app_sink_try_pull_sample`)
-  * periodic bus draining
-* **Diagnostics thread-safety**:
-
-  * Bus messages are collected into `DiagCtx::bus` under a mutex.
-  * Boundary counters are incremented from pad probes (GStreamer streaming threads); they write to `BoundaryFlowStats` fields. Those stats must be treated as atomic-ish/benign races (or upgraded to atomics if you want strict correctness).
-
-#### Ownership model (must be consistent across the library)
-
-* **GStreamer objects**: reference-counted. Rule: *if you store a pointer beyond the scope where you obtained it, you must `gst_object_ref` it; you must unref on shutdown.*
-* `FrameStream` and `TapStream` own:
-
-  * `pipeline_` (as a `GstElement*` with a ref held by creation; destroyed via `stop_and_unref`)
-  * `appsink_` (explicit `gst_object_unref` in `close`)
-* `FrameNV12Ref` owns:
-
-  * a `shared_ptr<SampleHolder>` which owns:
-
-    * `GstSample*` (unref)
-    * mapped `GstVideoFrame` (unmap)
-* RTSP server uses heap-allocated callback contexts (`PushCtx`) deleted via the `unprepared` signal path, and holds `appsrc` via `gst_object_ref`.
+### Common workflows
+- **Decode / ingest:** file or RTSP → depay/demux/parse → decode → convert/caps → appsink → C++ consumer
+- **Tap/debug:** insert a `DebugPoint("X")`, then `run_tap("X")` to inspect bytes / frames at that boundary
+- **Validate:** build + parse + preroll (PAUSED) to catch negotiation issues early
+- **Serve RTSP:** push synthetic frames into an RTSP server pipeline using `appsrc`
+- **ML output:** image/video/RTSP → decode → convert/scale → `add_output_tensor(...)` → `TensorStream`
 
 ---
 
-### 3) Dataflow: frames in/out, conversions, timestamps, caps negotiation
+## Repository layout
 
-#### Pipeline string generation
+### High-level structure
+- `include/` — public headers (the supported API surface)
+- `src/` — implementations
+- `docs/` — design docs (this file)
+- `examples/` — small runnable examples
+- `tests/` — unit/integration tests
+- `old_PipelineSession.*` — legacy monolithic implementation kept for reference/migration
 
-* Each `Node` produces:
+### Namespaced headers (`include/` vs `include/sima/`)
+You will see two parallel header trees:
 
-  * `gst_fragment(node_index)` → fragment appended into a `gst-launch`-compatible string.
-  * `element_names(node_index)` → deterministic element names used for naming enforcement and debug tooling.
+- `include/<module>/...`
+- `include/sima/<module>/...`
 
-`build_pipeline_full(...)`:
-
-* Concatenates fragments with `!`
-* Optionally inserts boundary markers:
-
-  * `identity name=sima_b<i> silent=true`
-  * Records `BoundaryFlowStats` for each boundary.
-
-`build_pipeline_tap(...)`:
-
-* Locates a `DebugPoint` by `kind()=="DebugPoint"` and `user_label()==<name>`.
-* Builds a truncated pipeline up to that node.
-* Appends:
-
-  * `appsink name=tap_<dbg> emit-signals=false sync=false max-buffers=1 drop=true`
-
-#### Output via appsink (`FrameStream`)
-
-* `run()` expects **NV12 + SystemMemory** (explicit contract).
-* In `FrameStream::next()`:
-
-  * Pull sample.
-  * Validate caps:
-
-    * `gst_video_info_from_caps`
-    * `GST_VIDEO_FORMAT_NV12`
-    * `require_system_memory_or_throw(...)` ensures not NVMM/device memory.
-  * Map buffer into `GstVideoFrame` (read).
-  * Return `FrameNV12Ref` containing:
-
-    * `y`, `uv` pointers + strides
-    * timestamps: `PTS/DTS/DURATION` copied from `GstBuffer`
-    * `keyframe` detection via `GST_BUFFER_FLAG_DELTA_UNIT`
-
-`next_copy()` produces a contiguous NV12 buffer (tight pack) by copying row-by-row, respecting strides.
-
-#### Tap output (`TapStream`)
-
-* Tap is intentionally more permissive:
-
-  * It reports caps string + memory features.
-  * It attempts a **tight pack** for a subset of raw formats using `gst_video_frame_map`:
-
-    * NV12, I420, RGB, BGR, GRAY8
-  * If it can’t pack, it tries `gst_buffer_map` and copies raw bytes.
-  * If mapping fails (typical on DMA/NVMM), it returns:
-
-    * `memory_mappable=false` and a human-readable reason.
-
-#### Timestamp semantics
-
-* Client-run pipelines:
-
-  * timestamps are whatever upstream provides.
-  * In debug/analysis, stalls are diagnosed with wall-clock monotonic time (`g_get_monotonic_time`) alongside buffer PTS.
-
-* RTSP server:
-
-  * pushes synthetic frames with:
-
-    * `PTS = frame_count * frame_duration_ns`
-    * `DTS = PTS`
-    * `DURATION = frame_duration_ns`
-  * `appsrc` is configured:
-
-    * `is-live=true`
-    * `format=GST_FORMAT_TIME`
-    * `do-timestamp=false` (we provide timestamps ourselves)
-
-#### Caps negotiation strategy
-
-* The library makes negotiation explicit through Nodes:
-
-  * e.g., `CapsNV12SysMem(w,h,fps)` inserts a capsfilter requiring `video/x-raw(memory:SystemMemory),format=NV12,...`
-* Any pipeline that intends to be consumed by `FrameStream` should end with such a caps node (or a decoder node that already enforces system memory output).
+The `include/sima/...` headers are **include shims** to provide a stable top-level include path (e.g. `#include "sima/pipeline/PipelineSession.h"`). The “real” headers are in `include/pipeline`, `include/gst`, etc. The shim headers should remain thin and free of implementation logic.
 
 ---
 
-### 4) RTSP server integration
+## Modules and responsibilities
 
-RTSP server is an **alternate runtime path** driven by GLib main loop + GstRTSPServer.
+### `builder/` — graph & composition (no GStreamer)
+**Purpose:** Define how pipelines are assembled from logical parts.
 
-Key behaviors in your implementation:
+Key types:
+- `Node` — interface implemented by each pipeline building block
+- `Graph`, `Builder`, `NodeGroup` — composition utilities and printing
 
-* `PipelineSession::run_rtsp(opt)`:
-
-  * Requires `appsrc`, `rtph264pay`, `h264parse`.
-  * Finds the `AppSrcImage` node to obtain:
-
-    * encoded dimensions and fps
-    * precomputed NV12 frame bytes shared via `shared_ptr<vector<uint8_t>>`
-  * Builds a launch string wrapped as: `"( <node0> ! <node1> ! ... )"`
-
-* Server thread:
-
-  * Creates `GstRTSPServer`, mounts a `GstRTSPMediaFactory`.
-  * `gst_rtsp_media_factory_set_shared(factory, FALSE)`
-
-    * each client gets its own media/pipeline instance.
-  * On `"media-configure"`:
-
-    * obtains the top element and finds `appsrc` named `"mysrc"`.
-    * sets caps and appsrc properties.
-    * allocates a per-media `PushCtx`:
-
-      * holds a ref to appsrc
-      * holds NV12 shared buffer
-      * schedules a periodic `g_timeout_add` to push buffers.
-    * hooks `"unprepared"` to cleanup, cancel timer, unref appsrc, delete ctx.
-
-**Client connection path**
-
-* Clients connect to `rtsp://127.0.0.1:<port>/<mount>`.
-* When a client requests media, RTSP server instantiates a new pipeline from the factory launch string and begins calling your timer-driven push callback.
-
-**Where pipelines attach**
-
-* The RTSP pipeline is the factory launch string itself.
-* Your code binds into that pipeline at `"mysrc"` inside `"media-configure"`.
+**Rule:** builder must remain mostly STL-only. It should not own GStreamer runtime objects.
 
 ---
 
-### 5) Error handling & logging strategy
+### `nodes/` — typed pipeline building blocks
+**Purpose:** Provide ready-to-use Node implementations that emit deterministic GStreamer fragments.
 
-#### Bus handling
+Examples:
+- `nodes/io/RTSPInput`, `nodes/io/AppSrcImage`
+- `nodes/common/*` (Caps, Queue, DebugPoint, AppSink, etc.)
+- `nodes/sima/*` (SiMa decode/encode/parse/pay nodes)
+- `nodes/rtp/*` (depay/payload helpers)
+- `nodes/groups/*` (common multi-node recipes)
 
-The design is: **bus polling is cheap and always-on** in run/tap.
-
-* `drain_bus(pipeline, diag)`:
-
-  * pops all available bus messages
-  * stores them into `DiagCtx::bus` (type/src/detail + wall_time_us)
-* `throw_if_bus_error(pipeline, diag, where)`:
-
-  * scans bus messages and throws immediately on `GST_MESSAGE_ERROR`
-  * on error:
-
-    * optionally dumps DOT (tagged by `where`)
-    * throws `PipelineError` carrying a `PipelineReport`
-
-This gives you:
-
-* structured error surfaces (exception contains a report)
-* stable reproduction hints (gst-launch string + env suggestions)
-* an always-on trail of relevant bus events
-
-#### Exceptions vs status
-
-* **Runtime “run/tap”**: throw exceptions on fatal errors (parse failure, missing sink, bus error).
-* **validate()**: returns a `PipelineReport` describing failures instead of throwing to keep CI-friendly.
-* **run_debug()**: catches both `PipelineError` and generic exceptions and returns a report.
-
-This is a deliberate tradeoff: developers can “fail fast” in normal flows, but still have a “report mode” for tests and diagnostics.
+**Contract:**
+Each Node must produce:
+- `gst_fragment(index)` — the GStreamer fragment for this node at a given index
+- `element_names(index)` — deterministic element names owned by this node (for diagnostics and enforcement)
 
 ---
 
-### 6) Debugging hooks & observability
+### `gst/` — thin GStreamer utilities
+**Purpose:** Small wrappers/helpers around common GStreamer patterns.
 
-Your framework already has the right “knobs”—the refactor should preserve them exactly:
+Examples:
+- initialization (`GstInit`)
+- parsing launch strings (`GstParseLaunch`)
+- bus draining/stringifying (`GstBusWatch`)
+- caps helpers / element introspection (`GstHelpers`, `GstIntrospection`)
+- pad taps / probe helpers (`GstPadTap`)
 
-* DOT dumps:
-
-  * enabled via `SIMA_GST_DOT_DIR`
-  * used on state failures, errors, and heavy snapshots
-* Boundary probes:
-
-  * activated by `SIMA_GST_BOUNDARY_PROBES=1`
-  * boundary insertion is mode-dependent:
-
-    * `SIMA_GST_RUN_INSERT_BOUNDARIES`
-    * `SIMA_GST_TAP_INSERT_BOUNDARIES`
-    * `SIMA_GST_VALIDATE_INSERT_BOUNDARIES`
-  * `boundary_summary()` identifies “likely stall” boundaries by last activity time.
-* Naming contract enforcement:
-
-  * `SIMA_GST_ENFORCE_NAMES=1`
-  * ensures every element in the parsed bin is accounted for by some node’s `element_names()`
-* Sliced appsink polling:
-
-  * `SIMA_GST_POLL_SLICE_MS` for responsiveness and ongoing bus/error checks
-  * `SIMA_GST_TIMEOUT_RETURNS_NULL` to choose between nullopt vs exception on timeout
-* Heavy report snapshots:
-
-  * DOT dump + a caps dump of bin element names (and optionally extended later)
+**Rule:** `gst/` must not depend on `pipeline/` (to avoid dependency cycles and “utility layer” bloat).
 
 ---
 
-### 7) Key design principles & tradeoffs
+### `pipeline/` — runtime orchestration and public API
+**Purpose:** Own the runtime lifecycle: build → parse → run → consume → teardown, with diagnostics.
 
-**Principles**
+Key types:
+- `PipelineSession` — the main entry point for users
+- `FrameStream` — consume frames from `appsink` (strict expectations)
+- `TensorStream` — consume tensors from `appsink` (ML-friendly)
+- `TapStream` — debug/tap intermediate points (more permissive)
+- `PipelineReport` — structured diagnostics for failures, stalls, and reproduction
+- `Errors` — exceptions (`PipelineError`) embedding a report
 
-1. **Stable public API, volatile internals**
+#### Internal pipeline diagnostics
+Under `include/pipeline/internal/`:
+- `Diagnostics.h` — shared diagnostics types used by runtime:
+  - `DiagCtx` (bus log + node reports + boundary counters)
+  - `BoundaryFlowCounters` (atomic counters updated from streaming threads)
+- `GstDiagnosticsUtil.h` — helpers for formatting and collecting GStreamer diagnostics
 
-   * `include/pipeline/PipelineSession.h` is stable.
-   * Internals can move freely as long as behavior and signatures remain unchanged.
+---
 
-2. **Deterministic names**
+### `contracts/` — validation rules
+**Purpose:** Encode “what a valid pipeline looks like” beyond “gst_parse_launch succeeded”.
 
-   * Element naming contract is essential for:
+Examples:
+- validator interfaces and registries
+- structured `ValidationReport`
 
-     * “get element by name”
-     * debug tap insertion
-     * boundary probes
-     * reliable diagnostics
+This layer can be used for CI and for catching issues before runtime.
 
-3. **Explicit memory contract where needed**
+---
 
-   * `FrameStream` is strict (NV12 + SystemMemory) because zero-copy CPU access must be safe.
-   * `TapStream` is flexible because debug is exploratory.
+### `policy/` — user-tunable behavior
+**Purpose:** Centralize tunables (defaults, memory constraints, encoder/decoder/RTSP policy choices).
+
+The goal is to make “knobs” explicit and discoverable rather than hidden in scattered code.
+
+---
+
+### `mpk/` — MPK integration
+**Purpose:** Load/interpret “model packs” (MPK) and adapt them into pipeline nodes or pipeline fragments.
+
+This module is intentionally optional and should not contaminate the core runtime path unless used.
+
+---
+
+## Runtime model (how execution works)
+
+### Initialization
+All runtime entry points call a single safe initialization routine:
+- `gst_init_once()` (thread-safe, `std::call_once`)
+
+Additionally, runtime paths may verify required plugins are present:
+- `require_element("appsink", ...)`, etc.
+
+### Building pipelines
+A `PipelineSession` is built by adding `Node` objects:
+
+```cpp
+sima::PipelineSession s;
+s.add(nodes::RTSPInput("rtsp://..."))
+ .add(nodes::H264DecodeSima())
+ .add(nodes::Caps(/*...NV12...*/))
+ .add(nodes::OutputAppSink());
+````
+
+Internally:
+
+1. The session asks each Node for `gst_fragment(i)` and concatenates fragments with `!`
+2. Optionally inserts **boundary markers** between nodes:
+
+   * `identity name=sima_b<i> silent=true`
+3. Builds a `DiagCtx`:
+
+   * `node_reports` for reproducibility
+   * `boundaries` as `BoundaryFlowCounters` (atomics)
+
+### Parsing & launch
+
+The library primarily uses:
+
+* `gst_parse_launch(pipeline_string, &err)`
+
+This provides flexibility and debuggability (you can replay the exact string with `gst-launch-1.0`).
+
+### Running
+
+Typical flow (`PipelineSession::run()`):
+
+1. Enforce contracts (e.g., “sink last” for `run()`)
+2. Build pipeline string (+ optional boundaries)
+3. Parse pipeline
+4. Optionally enforce element naming contract
+5. Attach optional boundary probes
+6. Set pipeline to `PLAYING`
+7. Return a `FrameStream` bound to an `appsink`
+
+`run_tap(name)` is similar, but truncates at a named `DebugPoint` and appends a dedicated `appsink` for the tap.
+
+### Teardown
+
+Teardown is intentionally defensive.
+Some plugin stacks can hang on state changes; the runtime prefers to avoid deadlocking the host process/CI.
+
+The common pattern is:
+
+* send EOS
+* set `GST_STATE_NULL`
+* unref objects
+* apply a timeout safeguard (leak instead of hanging if necessary)
+
+---
+
+## Threading & ownership model
+
+### Threads
+
+* **GStreamer streaming threads**: pad probes, decoding, scheduling
+* **User thread**: `appsink` polling + periodic bus draining
+* **RTSP server thread**: GLib main loop for `gst-rtsp-server` mode
+
+### Ownership rules (GStreamer objects)
+
+* GStreamer objects are reference counted.
+* If you store a `GstObject*` beyond the scope where it was acquired, you must `gst_object_ref()` it.
+* Always `gst_object_unref()` exactly once when done.
+
+### Diagnostics thread safety (important)
+
+Pad probes run on streaming threads, so **diagnostics updated from probes must be lock-free**.
+
+The design is:
+
+* `BoundaryFlowCounters` stores **atomics**
+* pad probes only do atomic `fetch_add()` / `store()`
+* reporting uses `BoundaryFlowCounters::snapshot()` to convert atomics → `BoundaryFlowStats` (plain ints)
+
+This avoids data races while keeping probes cheap.
+
+---
+
+## Diagnostics & observability
+
+### `DiagCtx` captures:
+
+* the pipeline string (for reproduction)
+* node reports (what each node generated)
+* bus messages (under a mutex)
+* boundary flow counters (atomics)
+
+### Boundary flow probes
+
+When enabled, the runtime attaches pad probes to boundary `identity` elements.
+They track:
+
+* buffer counts (in/out)
+* last seen PTS (ns)
+* last seen wall time (monotonic µs)
+
+This is used to generate “likely stall” summaries:
+
+* “we last saw activity entering/leaving boundary X at T”
+
+### Bus logging and errors
+
+The runtime drains bus messages into `DiagCtx`.
+On an error message (`GST_MESSAGE_ERROR`), it throws `PipelineError` including a `PipelineReport` and reproduction hints.
+
+### DOT dumps
+
+If enabled, the runtime can emit DOT graphs via `gst_debug_bin_to_dot_file_with_ts(...)` to a configured directory.
+
+---
+
+## Frame output vs Tap output
+
+### `FrameStream` (strict)
+
+`FrameStream` is meant for “real consumption”, so it tends to enforce strong assumptions (e.g., a CPU-mappable, expected format).
+
+Typical expectations:
+
+* consistent caps at the sink
+* predictable memory behavior (often SystemMemory)
+* stable format (commonly NV12)
+
+### `TensorStream` (ML-friendly)
+
+`TensorStream` is designed for ML consumers in C++:
+
+* returns `FrameTensorRef` (zero-copy view) or `FrameTensor` (owned copy)
+* supports RGB/BGR/GRAY8 and NV12/I420 raw formats
+* keeps an internal holder so future Python bindings can adopt without copies
+* provides a minimal DLPack-compatible struct for later integration
+
+### `TapStream` (permissive)
+
+`TapStream` is for debugging and inspection:
+
+* tries to map video frames when possible
+* falls back to raw buffer mapping when applicable
+* can report “not mappable” with reasons (e.g., DMABuf/NVMM)
+
+### run_debug() (per-tap outputs)
+
+`run_debug()` returns:
+
+* `RunDebugTap::packet` (raw bytes + caps)
+* `RunDebugTap::tensor` + `last_good_tensor` when mappable
+* per-tap error strings while continuing through later segments
+
+This preserves partial results when a later node is misconfigured.
+
+---
+
+## Pipeline serialization (save/load)
+
+Pipelines can be saved and restored as JSON:
+
+* `PipelineSession::save(path)` writes a versioned JSON with node kind/label/fragment/elements
+* `PipelineSession::load(path)` rehydrates nodes via a `ConfiguredNode` wrapper
+
+The current schema is intentionally minimal and reproducible, and can evolve to richer
+node configs later. This also serves as the bridge for future bindings and tooling.
+
+---
+
+## UX helpers
+
+* `PipelineSession::describe()` uses `GraphPrinter` to render a human-readable node list
+* `PipelineSession::to_gst()` returns the gst-launch string for quick debugging
+
+---
+
+## Element naming & determinism
+
+Deterministic element names are a core design principle because they enable:
+
+* `gst_bin_get_by_name()` for sinks and debug points
+* stable probe attachment
+* stable diagnostics and reproducibility
+* optional naming contract enforcement (“every element belongs to some node”)
+
+**Node authors must ensure**:
+
+* fragments include stable `name=` fields when elements must be retrievable
+* `element_names()` matches exactly what the fragment creates
+
+---
+
+## Validation & contracts
+
+Validation exists to catch issues earlier than runtime:
+
+* `validate()` can parse and preroll (PAUSED) to detect negotiation stalls
+* `contracts/` provides structured validators for “pipeline correctness”
+
+The intended behavior:
+
+* runtime flows throw exceptions on fatal errors
+* validation flows return structured reports (CI-friendly)
+
+---
+
+## RTSP server mode
+
+`run_rtsp()` uses `gst-rtsp-server`:
+
+* a server runs in a dedicated thread with a GLib main loop
+* on `media-configure`, the code locates the `appsrc` by name and configures caps/properties
+* frames are pushed periodically (timer-based) with explicit timestamps
+
+Each client may get its own media instance depending on factory configuration.
+
+---
+
+## Environment / configuration knobs
+
+The runtime supports environment-driven debugging knobs (names may vary by implementation):
+
+* enabling DOT dumps (output directory)
+* enabling boundary probes
+* enabling naming contract enforcement
+* validation preroll timeouts
+
+These knobs are intentionally outside the public API so you can turn them on in CI or in the field without recompiling.
+
+---
+
+## How to extend the library
+
+### Adding a new Node
+
+1. Create a header in `include/nodes/<category>/<YourNode>.h`
+2. Implement in `src/nodes/<category>/<YourNode>.cpp`
+3. Ensure:
+
+   * `gst_fragment(i)` is valid and deterministic
+   * all important elements are named and returned by `element_names(i)`
+4. Add tests (ideally one of):
+
+   * parse/validate tests
+   * run/tap tests with a simple source/sink pipeline
+
+### Adding runtime diagnostics
+
+* Prefer adding fields to `DiagCtx` and `PipelineReport`
+* If updates happen from streaming threads, use **atomics** (or another lock-free mechanism)
+* Convert to plain snapshot types for reporting
+
+---
+
+## Dependency rules (non-negotiable)
+
+* `builder/` should not depend on GStreamer or `pipeline/`
+* `gst/` should not depend on `pipeline/`
+* `nodes/` should not depend on `pipeline/` (Nodes are build-time descriptions, not runtime orchestrators)
+* `pipeline/` is the orchestrator and can depend on `gst/`, `builder/`, `nodes/`, `contracts/`, `policy/`, `mpk/`
+
+This keeps the architecture modular and prevents circular dependencies.
+
+---
+
+## Tests & examples
+
+* `examples/` show typical end-to-end usage patterns:
+
+  * decode RTSP
+  * run MPK
+  * run RTSP server
+* `tests/` verify critical behaviors:
+
+  * debug point behavior
+  * encoding/decoding
+  * file read paths
+  * group expansion equivalence (input groups)
+  * tensor output path + save/load round-trip
+
+When adding features, prefer adding tests that:
+
+* reproduce the pipeline string deterministically
+* validate caps negotiation assumptions
+* ensure failures produce useful `PipelineReport` diagnostics
+
+---
+
+## Design principles
+
+1. **Determinism wins**
+
+   * stable element names, stable pipeline strings, stable reports
+
+2. **Debuggability is first-class**
+
+   * bus logs, DOT dumps, boundary probes, clear reproduction steps
+
+3. **Safe concurrency**
+
+   * streaming-thread probes only touch atomics (snapshots produce plain reports)
 
 4. **Never hang the process**
 
-   * `stop_and_unref()` chooses “leak pipeline” over hanging CI due to known plugin deadlocks.
+   * teardown is defensive; avoid blocking forever on broken plugin stacks
 
-5. **Observability is first-class**
+5. **Keep the public API stable**
 
-   * You always collect bus messages.
-   * You can optionally attach probes and generate DOT graphs.
-
-**Tradeoffs**
-
-* Using `gst_parse_launch` is simple and flexible, but makes “strong typing” harder. The node interface is the bridge: typed API → launch string.
-* Boundary stats are lightweight but not perfectly synchronized; “good enough to locate stall points” beats heavy locking in hot paths.
-* Async teardown is pragmatic; it’s not pretty, but it prevents deadlocks from taking down end-to-end tests.
-
----
-
-### 8) What goes wrong (common failure modes)
-
-1. **Caps mismatch at appsink**
-
-   * Symptoms: `FrameStream::next` throws “expected NV12”.
-   * Causes:
-
-     * missing/incorrect capsfilter before the sink
-     * decoder outputs I420/RGB
-   * Fix:
-
-     * add `CapsNV12SysMem(w,h,fps)` or ensure decoder node enforces NV12.
-
-2. **Non-SystemMemory buffers**
-
-   * Symptoms: `require_system_memory_or_throw` triggers.
-   * Causes:
-
-     * upstream produces NVMM / DMA buffers (Jetson-style)
-   * Fix:
-
-     * insert conversion/download elements or enforce `(memory:SystemMemory)` in caps before the DebugPoint / appsink.
-     * ensure decoder node converts to system memory (your sima decoder already does via capsfilter).
-
-3. **Negotiation stalls / preroll timeouts**
-
-   * Symptoms:
-
-     * validate() times out pulling preroll
-     * run() returns nullopt repeatedly (if configured)
-   * Causes:
-
-     * live source without data
-     * missing depay/parse step
-     * wrong caps at a join
-   * Fix:
-
-     * enable boundary probes + boundary insertion; check `boundary_summary`.
-     * check bus messages in report snapshot.
-
-4. **State-change deadlocks in plugins**
-
-   * Symptoms:
-
-     * teardown hangs inside `gst_element_set_state(NULL)`
-   * Mitigation:
-
-     * `stop_and_unref()` async teardown with timeout.
-   * Follow-up:
-
-     * you can optionally add a “kill switch” policy later to aggressively abort.
-
-5. **RTSP server main loop issues**
-
-   * Symptoms:
-
-     * server reports “running” but no media
-     * callbacks not firing
-   * Causes:
-
-     * not attaching server, or main loop not started
-     * push timer stopped early due to flow return
-   * Fix:
-
-     * check `"media-configure"` path and `gst_app_src_push_buffer` return values.
-     * confirm mount path formatting (`/image` default).
-
-6. **Buffer lifetime bugs**
-
-   * Symptoms:
-
-     * crashes or corrupted frames when user holds references
-   * Root cause:
-
-     * returning raw pointers without owning the underlying sample mapping
-   * Your mitigation:
-
-     * `FrameNV12Ref` holds `shared_ptr<SampleHolder>` that owns mapping + sample.
-
-7. **Latency / backpressure**
-
-   * Symptoms:
-
-     * high latency or stuttering
-   * Causes:
-
-     * missing queues, too-large buffers, sync=true, drop=false
-   * Your choices:
-
-     * appsink configured `max-buffers=1 drop=true sync=false` for low latency.
-
----
-
-### 9) Dependency diagram (text)
-
-Modules in your repository (based on your tree) and allowed dependencies:
+   * internal refactors should not break user code unless intentionally versioned
 
 ```
-[pipeline] PipelineSession / FrameStream / TapStream / Errors / PipelineReport
-   |--> [builder] Graph / Builder / Node / GraphPrinter
-   |--> [nodes] typed node implementations + node groups
-   |--> [gst] GstInit / GstHelpers / GstParseLaunch / GstBusWatch / GstPadTap / GstIntrospection
-   |--> [policy] DefaultPolicy, MemoryPolicy, EncoderPolicy, DecoderPolicy, RtspPolicy
-   |--> [contracts] Validators / ContractRegistry / ValidationReport
-   \--> [mpk] MpKLoader / MpKPipelineAdapter (optional integration)
-
-[nodes] depends on:
-   |--> [builder] Node interface
-   |--> [gst] (only for introspection helpers, optional)
-   \--> OpenCV (ONLY for AppSrcImage implementation)
-
-[gst] depends on:
-   \--> GStreamer / GLib only (NO pipeline/builder/nodes)
-
-[builder] depends on:
-   \--> STL only (NO GStreamer)
-
-[contracts] depends on:
-   \--> builder + policy (+ STL)
-
-[policy] depends on:
-   \--> STL only (or minimal)
-```
-
-Hard rule: **`gst/` must not depend on `pipeline/`** (no circular diagnostics exceptions leaking downward). `pipeline/` is the top-level orchestrator.
-
----
-
-## (B) Concrete refactor plan
-
-You already have the correct high-level folder structure and headers in `include/`. The refactor plan below is **prescriptive**: it matches your current tree and explains exactly what each file “owns,” so the monolith becomes a set of clean, testable modules.
-
-### 1) Proposed folder structure (matches your repo)
-
-```
-include/
-  gst/            # public gst utilities (thin)
-  pipeline/       # public runtime API: PipelineSession, FrameStream, TapStream, Reports, Errors
-  nodes/          # public node APIs
-  builder/        # public builder graph API
-  policy/         # public policy knobs
-  contracts/      # public validation layer
-  mpk/            # model-pack adapter layer
-
-src/
-  gst/            # implementations of include/gst
-  pipeline/       # implementations of include/pipeline
-  nodes/          # implementations of include/nodes
-  builder/        # implementations of include/builder
-  policy/         # implementations
-  contracts/      # implementations
-  mpk/            # implementations
-
-old_PipelineSession.cpp  # kept only during migration; deleted at end
-```
-
-### 2) New file list (headers + cpp) with responsibilities
-
-You already have most of these in place; this is the “ownership map” Codex must follow.
-
-#### `gst/` module
-
-* `include/gst/GstInit.h` + `src/gst/GstInit.cpp`
-  Owns: `gst_init_once()`
-
-* `include/gst/GstHelpers.h` + `src/gst/GstHelpers.cpp`
-  Owns:
-
-  * env helpers: `env_bool`, `env_str`
-  * time helper: `now_mono_us`
-  * string helpers: `sanitize_name`, `json_escape`
-  * caps formatting: `gst_caps_to_string_safe`, `gst_structure_to_string_safe`, `caps_features_string`
-  * DOT dump: `maybe_dump_dot`
-
-* `include/gst/GstIntrospection.h` + `src/gst/GstIntrospection.cpp`
-  Owns: `element_exists`, `require_element`
-
-* `include/gst/GstBusWatch.h` + `src/gst/GstBusWatch.cpp`
-  Owns:
-
-  * `gst_message_to_string`
-  * `drain_bus`
-  * `throw_if_bus_error`
-    (and **no** dependency on pipeline errors: return status or accept callbacks; pipeline layer converts into exceptions)
-
-* `include/gst/GstPadTap.h` + `src/gst/GstPadTap.cpp`
-  Owns:
-
-  * boundary probe ctx + attach
-  * boundary summary builder
-
-* `include/gst/GstParseLaunch.h` + `src/gst/GstParseLaunch.cpp`
-  Owns:
-
-  * thin wrapper around `gst_parse_launch` to normalize errors and return a `GstElement*`
-
-#### `pipeline/` module
-
-* `include/pipeline/PipelineReport.h` + `src/pipeline/PipelineReport.cpp`
-  Owns: `PipelineReport::to_json()`
-
-* `include/pipeline/Errors.h` + `src/pipeline/Errors.cpp`
-  Owns: `PipelineError` (exception + embedded report)
-
-* `include/pipeline/TapStream.h` + `src/pipeline/TapStream.cpp`
-  Owns:
-
-  * `TapStream` runtime object
-  * `TapPacket` packing logic (calls gst helpers)
-  * tight-pack helpers (`infer_tap_format_and_meta`, `pack_raw_video_tight`)
-
-* `include/pipeline/PipelineSession.h` + `src/pipeline/PipelineSession.cpp`
-  Owns:
-
-  * session orchestration: `run`, `run_tap`, `validate`, `run_rtsp`, `run_debug`
-  * build pipeline strings using nodes (or calls into a `builder` adapter)
-  * enforce sink-last
-  * naming contract enforcement (or moved to `contracts/` if you prefer)
-  * keeps `last_pipeline_`
-
-* `src/pipeline/internal/DiagCtx.h` (private header; **not** installed)
-  Owns:
-
-  * `DiagCtx` definition and `snapshot_basic()`
-  * `BoundaryFlowStats` storage strategy
-  * makes diagnostics sharable without polluting public headers
-
-* `src/pipeline/internal/StopAndUnref.h/.cpp` (private)
-  Owns:
-
-  * `stop_and_unref()` teardown watchdog
-
-* `src/pipeline/internal/RtspServerImpl.*` (private)
-  Owns:
-
-  * `RtspServerImpl`, `PushCtx`, callbacks
-  * `RtspServerHandle` behavior (public type still in include/pipeline or include/policy if you keep it there)
-
-#### `nodes/` module
-
-* Each header under `include/nodes/**` must have a matching `.cpp` under `src/nodes/**`:
-
-  * `nodes/common/*` → simple fragments and deterministic element names
-  * `nodes/io/AppSrcImage.cpp` → OpenCV + NV12 packing/padding (only file that needs OpenCV)
-  * `nodes/rtp/*` → depay/pay
-  * `nodes/sima/*` → sima encoder/decoder/parse elements
-  * `nodes/groups/*` → composition helpers that return vectors of nodes or a `NodeGroup`
-
-**Rule**: node `.cpp` files must not include pipeline headers.
-
----
-
-### 3) Public vs private headers policy
-
-* **Public** (`include/**`):
-
-  * stable API types: `PipelineSession`, `FrameStream`, `TapStream`, `PipelineReport`, node types, builder graph, contracts, policy.
-  * must avoid heavy includes: forward declare GStreamer structs whenever possible.
-
-* **Private** (`src/**/internal/**`):
-
-  * any “glue structs” like `DiagCtx`, `BuildResult`, `SampleHolder`, RTSP callback contexts.
-  * anything that would otherwise create circular dependencies or balloon compile times.
-
-**Non-negotiable**: private headers must never be included from public headers.
-
----
-
-### 4) Forward declarations vs includes rules
-
-**Public headers**
-
-* Forward declare:
-
-  * `struct _GstElement; struct _GstCaps; struct _GstSample; struct _GstBuffer;`
-* Do **not** include `<gst/gst.h>` or `<opencv2/opencv.hpp>` in public headers.
-
-**.cpp files**
-
-* Include your own header first (`#include "..."`).
-* Then include only what you use.
-* Keep OpenCV restricted to `AppSrcImage.cpp` (and any optional image utilities).
-
----
-
-### 5) Naming conventions, namespaces, ownership rules
-
-**Namespaces**
-
-* Public API lives in `namespace sima`.
-* Node factories live in `namespace sima::nodes`.
-* Private helper namespaces are allowed but should be inside `sima` (e.g., `sima::detail`).
-
-**Element names**
-
-* Must remain deterministic:
-
-  * `mysink`, `mysrc`, `pay0`, and `n<idx>_<role>` patterns.
-* Any refactor must not change these names unless you intentionally version the naming contract.
-
-**Ownership rules**
-
-* If a struct stores a `GstElement*` longer than the local scope, it must hold a ref.
-* Callback user_data must be heap-allocated and freed exactly once via a destroy notify or a “unprepared” handler.
-* `FrameNV12Ref` must always keep the underlying mapping alive via a shared holder.
-
----
-
-### 6) Order of operations to refactor safely (step-by-step)
-
-This is the safest migration plan from `old_PipelineSession.cpp` into your existing `src/` layout with **no behavior changes**:
-
-1. **Move pure helpers first**
-
-   * Extract `gst_init_once`, env helpers, JSON escape, sanitize name, caps stringify, DOT dump into `src/gst/*`.
-   * Zero behavior changes; just move code.
-
-2. **Extract bus watch**
-
-   * Move `gst_message_to_string`, `drain_bus`, `throw_if_bus_error` into `src/gst/GstBusWatch.cpp`.
-   * Ensure pipeline layer still throws `PipelineError` with the same text/report.
-
-3. **Extract boundary probes**
-
-   * Move `BoundaryProbeCtx`, `boundary_probe_cb`, `attach_boundary_probes`, `boundary_summary` into `src/gst/GstPadTap.cpp`.
-   * Keep env keys and defaults unchanged.
-
-4. **Extract teardown watchdog**
-
-   * Move `stop_and_unref` into `src/pipeline/internal/StopAndUnref.*`.
-   * Keep timeout, behavior (leak on timeout), and warning message unchanged.
-
-5. **Extract diagnostics context**
-
-   * Move `DiagCtx` + `snapshot_basic()` into `src/pipeline/internal/DiagCtx.h`.
-   * Keep report population identical.
-
-6. **Extract TapStream**
-
-   * Move `TapStream` + packing helpers into `src/pipeline/TapStream.cpp`.
-   * Ensure `TapPacket` fields identical and `memory_mappable` behavior unchanged.
-
-7. **Extract FrameStream**
-
-   * Move `FrameStream` implementation into `src/pipeline/PipelineSession.cpp` or a dedicated `FrameStream.cpp` if you have that header.
-   * Keep sliced polling behavior and env flags unchanged.
-
-8. **Extract nodes**
-
-   * Move each node implementation into matching `src/nodes/**` file, one file per node category.
-   * Preserve `gst_fragment()` output exactly (including spacing and element names).
-
-9. **Extract RTSP server**
-
-   * Move `RtspServerImpl`, `PushCtx`, callbacks into `src/pipeline/internal/RtspServerImpl.*`.
-   * Keep mount default, URL format, caps setting, timer behavior unchanged.
-
-10. **Slim PipelineSession.cpp**
-
-* After extraction, `PipelineSession.cpp` should contain only:
-
-  * orchestration logic
-  * pipeline build calls
-  * name enforcement call
-* No OpenCV, no big helper structs.
-
-11. **Delete old_PipelineSession.cpp**
-
-* Only after tests pass and the new pipeline module is functionally identical.
-
----
-
-### 7) Definition of done checklist
-
-* ✅ `old_PipelineSession.cpp` removed from build and deleted (or kept only as reference outside compilation).
-* ✅ All tests in `tests/` pass.
-* ✅ `PipelineSession.h` public API unchanged (unless explicitly requested).
-* ✅ Element names and pipeline strings match baseline outputs (where applicable).
-* ✅ Env flags preserved:
-
-  * `SIMA_GST_DOT_DIR`, `SIMA_GST_BOUNDARY_PROBES`, `SIMA_GST_*_INSERT_BOUNDARIES`,
-  * `SIMA_GST_ENFORCE_NAMES`, `SIMA_GST_POLL_SLICE_MS`, `SIMA_GST_TIMEOUT_RETURNS_NULL`, etc.
-* ✅ No public header includes OpenCV or `gst/*.h`.
-* ✅ No `gst/` code depends on `pipeline/` headers (no circular deps).
-* ✅ `AppSrcImage.cpp` is the only compilation unit that includes OpenCV headers.
-* ✅ `clang-tidy`/warnings not worse than before (if enabled).
-* ✅ Leak-on-timeout teardown behavior preserved exactly.
