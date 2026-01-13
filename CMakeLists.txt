@@ -148,6 +148,9 @@ target_link_libraries(unit_image_group_runtime_test PRIVATE pipelinesession)
 add_executable(unit_tensorstream_test tests/unit_tensorstream_test.cpp)
 target_link_libraries(unit_tensorstream_test PRIVATE pipelinesession)
 
+add_executable(output_appsink_policy_test tests/output_appsink_policy_test.cpp)
+target_link_libraries(output_appsink_policy_test PRIVATE pipelinesession)
+
 add_executable(modelsession_resnet50_guard_test tests/modelsession_resnet50_guard_test.cpp)
 target_link_libraries(modelsession_resnet50_guard_test PRIVATE pipelinesession)
 
@@ -214,6 +217,10 @@ add_test(NAME unit_image_group_runtime_test
 
 add_test(NAME unit_tensorstream_test
   COMMAND unit_tensorstream_test ${CMAKE_SOURCE_DIR}/test.jpg
+)
+
+add_test(NAME output_appsink_policy_test
+  COMMAND output_appsink_policy_test
 )
 
 add_test(NAME modelsession_resnet50_guard_test

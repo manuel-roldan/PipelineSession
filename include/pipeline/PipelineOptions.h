@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sima/nodes/common/AppSink.h"
 #include "sima/pipeline/PipelineReport.h"
 #include "sima/pipeline/TapStream.h"
 #include "sima/pipeline/FrameStream.h"
@@ -38,6 +39,8 @@ struct OutputTensorOptions {
 
   bool use_videoconvert = true;
   bool use_videoscale = true;
+
+  OutputAppSinkOptions sink;
 };
 
 struct RunDebugTap {

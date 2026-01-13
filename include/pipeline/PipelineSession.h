@@ -97,7 +97,7 @@ public:
   std::string describe(const GraphPrinter::Options& opt = {}) const;
   std::string to_gst(bool insert_boundaries = false) const;
 
-  // Optional external guard for single-owner enforcement.
+  // Optional external guard (e.g., provided by ModelSession).
   void set_guard(std::shared_ptr<void> guard);
 
   // Save/load pipeline config for reproducible runs.

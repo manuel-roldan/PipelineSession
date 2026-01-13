@@ -1673,15 +1673,7 @@ FrameStream PipelineSession::run() {
   BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
   last_pipeline_ = br.pipeline_string;
 
-  std::string guard_error;
   auto guard = guard_;
-  if (!guard) {
-    guard = pipeline_internal::acquire_simaai_guard(
-        "PipelineSession::run", last_pipeline_, /*force=*/false, &guard_error);
-    if (!guard_error.empty()) {
-      throw std::runtime_error(guard_error);
-    }
-  }
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
@@ -1741,15 +1733,7 @@ TensorStream PipelineSession::run_tensor() {
   BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
   last_pipeline_ = br.pipeline_string;
 
-  std::string guard_error;
   auto guard = guard_;
-  if (!guard) {
-    guard = pipeline_internal::acquire_simaai_guard(
-        "PipelineSession::run_tensor", last_pipeline_, /*force=*/false, &guard_error);
-    if (!guard_error.empty()) {
-      throw std::runtime_error(guard_error);
-    }
-  }
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
@@ -1810,17 +1794,6 @@ RunInputResult PipelineSession::run(const cv::Mat& input) {
 
   BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
   last_pipeline_ = br.pipeline_string;
-
-  std::string guard_error;
-  auto guard = guard_;
-  if (!guard) {
-    guard = pipeline_internal::acquire_simaai_guard(
-        "PipelineSession::run(input)", last_pipeline_, /*force=*/false, &guard_error);
-    if (!guard_error.empty()) {
-      throw std::runtime_error(guard_error);
-    }
-  }
-  (void)guard;
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
@@ -1989,15 +1962,7 @@ TapStream PipelineSession::run_tap(const std::string& point_name) {
   BuildResult br = build_pipeline_tap(nodes_, point_name, insert_boundaries);
   last_pipeline_ = br.pipeline_string;
 
-  std::string guard_error;
   auto guard = guard_;
-  if (!guard) {
-    guard = pipeline_internal::acquire_simaai_guard(
-        "PipelineSession::run_tap", last_pipeline_, /*force=*/false, &guard_error);
-    if (!guard_error.empty()) {
-      throw std::runtime_error(guard_error);
-    }
-  }
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
@@ -2084,18 +2049,6 @@ PipelineReport PipelineSession::validate(const ValidateOptions& opt) const {
 
   BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
   rep.pipeline_string = br.pipeline_string;
-
-  std::string guard_error;
-  auto guard = guard_;
-  if (!guard) {
-    guard = pipeline_internal::acquire_simaai_guard(
-        "PipelineSession::validate", rep.pipeline_string, /*force=*/false, &guard_error);
-    if (!guard_error.empty()) {
-      rep.repro_note = guard_error;
-      return rep;
-    }
-  }
-  (void)guard;
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(rep.pipeline_string.c_str(), &err);
@@ -2205,18 +2158,6 @@ PipelineReport PipelineSession::validate(const ValidateOptions& opt,
 
   BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
   rep.pipeline_string = br.pipeline_string;
-
-  std::string guard_error;
-  auto guard = guard_;
-  if (!guard) {
-    guard = pipeline_internal::acquire_simaai_guard(
-        "PipelineSession::validate(input)", rep.pipeline_string, /*force=*/false, &guard_error);
-    if (!guard_error.empty()) {
-      rep.repro_note = guard_error;
-      return rep;
-    }
-  }
-  (void)guard;
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(rep.pipeline_string.c_str(), &err);
@@ -2361,15 +2302,7 @@ RtspServerHandle PipelineSession::run_rtsp(const RtspServerOptions& opt) {
   }
   last_pipeline_ = "( " + ss.str() + " )";
 
-  std::string guard_error;
   auto guard = guard_;
-  if (!guard) {
-    guard = pipeline_internal::acquire_simaai_guard(
-        "PipelineSession::run_rtsp", last_pipeline_, /*force=*/false, &guard_error);
-    if (!guard_error.empty()) {
-      throw std::runtime_error(guard_error);
-    }
-  }
 
   auto* impl = new RtspServerImpl();
   impl->port = opt.port;
@@ -2548,26 +2481,16 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
   }
   last_pipeline_ = combined.str();
 
-  if (pipeline_internal::pipeline_uses_simaai(last_pipeline_) && segment_strings.size() > 1) {
+  const bool guard_enforced = (guard_ != nullptr);
+  if (guard_enforced &&
+      pipeline_internal::pipeline_uses_simaai(last_pipeline_) &&
+      segment_strings.size() > 1) {
     out.report.pipeline_string = last_pipeline_;
     out.report.repro_note =
         "run_debug: multiple DebugPoint segments require multiple pipelines.\n" +
         pipeline_internal::simaai_single_owner_error("PipelineSession::run_debug");
     return out;
   }
-
-  std::string guard_error;
-  auto guard = guard_;
-  if (!guard) {
-    guard = pipeline_internal::acquire_simaai_guard(
-        "PipelineSession::run_debug", last_pipeline_, /*force=*/false, &guard_error);
-    if (!guard_error.empty()) {
-      out.report.pipeline_string = last_pipeline_;
-      out.report.repro_note = guard_error;
-      return out;
-    }
-  }
-  (void)guard;
 
   auto diag = std::make_shared<DiagCtx>();
   diag->pipeline_string = last_pipeline_;
@@ -2825,26 +2748,16 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt, const cv::
   }
   last_pipeline_ = combined.str();
 
-  if (pipeline_internal::pipeline_uses_simaai(last_pipeline_) && segment_strings.size() > 1) {
+  const bool guard_enforced = (guard_ != nullptr);
+  if (guard_enforced &&
+      pipeline_internal::pipeline_uses_simaai(last_pipeline_) &&
+      segment_strings.size() > 1) {
     out.report.pipeline_string = last_pipeline_;
     out.report.repro_note =
         "run_debug(input): multiple DebugPoint segments require multiple pipelines.\n" +
         pipeline_internal::simaai_single_owner_error("PipelineSession::run_debug(input)");
     return out;
   }
-
-  std::string guard_error;
-  auto guard = guard_;
-  if (!guard) {
-    guard = pipeline_internal::acquire_simaai_guard(
-        "PipelineSession::run_debug(input)", last_pipeline_, /*force=*/false, &guard_error);
-    if (!guard_error.empty()) {
-      out.report.pipeline_string = last_pipeline_;
-      out.report.repro_note = guard_error;
-      return out;
-    }
-  }
-  (void)guard;
 
   auto diag = std::make_shared<DiagCtx>();
   diag->pipeline_string = last_pipeline_;
@@ -3070,7 +2983,7 @@ PipelineSession& PipelineSession::add_output_tensor(const OutputTensorOptions& o
                      o.target_height,
                      o.target_fps,
                      sima::CapsMemory::SystemMemory));
-  add(nodes::OutputAppSink());
+  add(nodes::OutputAppSink(o.sink));
   return *this;
 }
 

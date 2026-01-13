@@ -253,7 +253,7 @@ The common pattern is:
 ## SimaAI guard (single-owner + single-use)
 
 SimaAI plugins are not safe to run concurrently or repeatedly in the same process.
-To avoid crashes, the runtime enforces a process-level guard:
+To avoid crashes, ModelSession enforces a process-level guard:
 
 - **Single-owner:** while a SimaAI pipeline is active, any new attempt returns:
   “SimaAI pipelines are single-owner per process; spawn a child process to run another pipeline.”
@@ -262,9 +262,9 @@ To avoid crashes, the runtime enforces a process-level guard:
 
 Implementation:
 - `pipeline/internal/SimaaiGuard` tracks `in_use` and `used_once`.
-- `PipelineSession` acquires the guard unless an external guard is supplied via `set_guard()`.
 - `ModelSession` acquires the guard at `init()` and holds it for the session lifetime.
-- Guard acquisition is conditional on `pipeline_uses_simaai()` detecting simaai elements.
+- `PipelineSession` only uses a guard when one is explicitly supplied via `set_guard()`.
+- `pipeline_uses_simaai()` is used for debug segmentation constraints when a guard is present.
 
 This is a defensive constraint until the simaai plugin lifecycle supports safe re-init.
 
