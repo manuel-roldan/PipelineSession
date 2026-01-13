@@ -12,6 +12,7 @@
 #include "pipeline/TensorStream.h"
 #include "pipeline/internal/Diagnostics.h"
 #include "pipeline/internal/GstDiagnosticsUtil.h"
+#include "pipeline/internal/SimaaiGuard.h"
 #include "pipeline/internal/TensorUtil.h"
 #include "builder/Node.h"
 #include "builder/NodeGroup.h"
@@ -33,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -48,6 +50,13 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#if __has_include(<simaai/gstsimaaibufferpool.h>)
+#include <simaai/gstsimaaibufferpool.h>
+#define SIMA_HAS_SIMAAI_POOL 1
+#else
+#define SIMA_HAS_SIMAAI_POOL 0
+#endif
 
 namespace sima {
 
@@ -79,6 +88,19 @@ static std::string env_str(const char* key, const std::string& def_val = "") {
   return std::string(v);
 }
 
+static int env_int(const char* key, int def_val) {
+  const char* v = std::getenv(key);
+  if (!v || !*v) return def_val;
+  return std::atoi(v);
+}
+
+static void maybe_guard_sleep(const char* where) {
+  const int ms = env_int("SIMA_GUARD_TEST_HOLD_MS", 0);
+  if (ms <= 0) return;
+  (void)where;
+  std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
 static std::string sanitize_name(const std::string& in) {
   std::string out;
   out.reserve(in.size());
@@ -93,6 +115,13 @@ static std::string sanitize_name(const std::string& in) {
   if (out.empty()) out = "dbg";
   if (!out.empty() && (out[0] >= '0' && out[0] <= '9')) out = "_" + out;
   return out;
+}
+
+static std::string upper_copy(std::string s) {
+  for (char& c : s) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return s;
 }
 
 static void maybe_dump_dot(GstElement* pipeline, const std::string& tag) {
@@ -673,6 +702,28 @@ static std::string build_debug_segment(
   return ss.str();
 }
 
+static std::string last_non_queue_element(const std::vector<std::string>& elems) {
+  for (auto it = elems.rbegin(); it != elems.rend(); ++it) {
+    if (it->rfind("q", 0) == 0) continue;
+    return *it;
+  }
+  return {};
+}
+
+static std::string segment_producer_name(
+    const std::vector<std::shared_ptr<Node>>& nodes,
+    int debug_index) {
+  const int idx = debug_index - 1;
+  if (idx < 0 || idx >= static_cast<int>(nodes.size())) return "decoder";
+  const auto& node = nodes[static_cast<size_t>(idx)];
+  if (!node) return "decoder";
+  const auto elems = node->element_names(idx);
+  std::string name = last_non_queue_element(elems);
+  if (!name.empty()) return name;
+  std::string label = node->user_label();
+  return label.empty() ? "decoder" : label;
+}
+
 // =====================================================================================
 // Diag context + boundary stats (compatible with PipelineReport / TapStream)
 // =====================================================================================
@@ -1024,6 +1075,336 @@ static void enforce_sink_last(const std::vector<std::shared_ptr<Node>>& nodes) {
   }
 }
 
+static const InputAppSrc* find_input_appsrc(
+    const std::vector<std::shared_ptr<Node>>& nodes,
+    int* index_out) {
+  const InputAppSrc* found = nullptr;
+  int found_idx = -1;
+
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (!nodes[i]) continue;
+    if (auto* src = dynamic_cast<InputAppSrc*>(nodes[i].get())) {
+      if (found) {
+        throw std::runtime_error("InvalidPipeline: multiple InputAppSrc nodes found");
+      }
+      found = src;
+      found_idx = static_cast<int>(i);
+    }
+  }
+
+  if (index_out) *index_out = found_idx;
+  return found;
+}
+
+static void throw_if_input_appsrc_present(
+    const std::vector<std::shared_ptr<Node>>& nodes,
+    const std::string& where) {
+  int idx = -1;
+  const InputAppSrc* src = find_input_appsrc(nodes, &idx);
+  if (!src) return;
+  throw std::runtime_error(
+      where +
+      ": InputAppSrc() is present; use the input overload (run(input), "
+      "run_debug(opt, input), validate(opt, input)).");
+}
+
+static void require_input_appsrc(const std::vector<std::shared_ptr<Node>>& nodes,
+                                 const std::string& where,
+                                 const InputAppSrc** out_src) {
+  int idx = -1;
+  const InputAppSrc* src = find_input_appsrc(nodes, &idx);
+  if (!src) {
+    throw std::runtime_error(where + ": missing InputAppSrc() node");
+  }
+  if (idx != 0) {
+    throw std::runtime_error(where + ": InputAppSrc() must be the first node");
+  }
+  if (out_src) *out_src = src;
+}
+
+struct InputCapsConfig {
+  std::string media_type;
+  std::string format;
+  int width = -1;
+  int height = -1;
+  int depth = -1;
+  size_t bytes = 0;
+};
+
+static InputCapsConfig infer_input_caps(const InputAppSrcOptions& opt,
+                                        const cv::Mat& input) {
+  if (input.empty()) {
+    throw std::invalid_argument("run(input): input frame is empty");
+  }
+
+  InputCapsConfig out;
+  out.media_type = opt.media_type.empty() ? "video/x-raw" : opt.media_type;
+
+  const int in_w = input.cols;
+  const int in_h = input.rows;
+  const int in_c = input.channels();
+
+  const bool is_video = (out.media_type == "video/x-raw");
+  const bool is_tensor = (out.media_type == "application/vnd.simaai.tensor");
+
+  if (!is_video && !is_tensor) {
+    throw std::invalid_argument("run(input): unsupported media_type: " + out.media_type);
+  }
+
+  std::string fmt = upper_copy(opt.format);
+  if (is_video) {
+    if (fmt.empty()) {
+      fmt = (in_c == 1) ? "GRAY8" : "BGR";
+    }
+    if (fmt == "GRAY") fmt = "GRAY8";
+
+    if (fmt != "RGB" && fmt != "BGR" && fmt != "GRAY8") {
+      throw std::invalid_argument("run(input): unsupported video format: " + fmt);
+    }
+
+    if ((fmt == "RGB" || fmt == "BGR") && input.type() != CV_8UC3) {
+      throw std::invalid_argument("run(input): expected CV_8UC3 for video/x-raw " + fmt);
+    }
+    if (fmt == "GRAY8" && input.type() != CV_8UC1) {
+      throw std::invalid_argument("run(input): expected CV_8UC1 for video/x-raw GRAY8");
+    }
+
+    out.width = (opt.width > 0) ? opt.width : in_w;
+    out.height = (opt.height > 0) ? opt.height : in_h;
+    if (opt.width > 0 && opt.width != in_w) {
+      throw std::invalid_argument("run(input): input width does not match InputAppSrcOptions");
+    }
+    if (opt.height > 0 && opt.height != in_h) {
+      throw std::invalid_argument("run(input): input height does not match InputAppSrcOptions");
+    }
+  } else {
+    if (fmt.empty()) fmt = "FP32";
+    if (fmt != "FP32") {
+      throw std::invalid_argument("run(input): only FP32 tensor input is supported");
+    }
+    if (input.type() != CV_32FC1 && input.type() != CV_32FC3) {
+      throw std::invalid_argument("run(input): tensor input must be CV_32FC1 or CV_32FC3");
+    }
+    out.width = (opt.width > 0) ? opt.width : in_w;
+    out.height = (opt.height > 0) ? opt.height : in_h;
+    out.depth = (opt.depth > 0) ? opt.depth : in_c;
+    if (opt.width > 0 && opt.width != in_w) {
+      throw std::invalid_argument("run(input): tensor input width does not match InputAppSrcOptions");
+    }
+    if (opt.height > 0 && opt.height != in_h) {
+      throw std::invalid_argument("run(input): tensor input height does not match InputAppSrcOptions");
+    }
+    if (opt.depth > 0 && opt.depth != in_c) {
+      throw std::invalid_argument("run(input): tensor input depth does not match InputAppSrcOptions");
+    }
+  }
+
+  out.format = fmt;
+  out.bytes = input.total() * input.elemSize();
+  return out;
+}
+
+static GstCaps* build_input_caps(const InputCapsConfig& cfg) {
+  if (cfg.media_type == "video/x-raw") {
+    return gst_caps_new_simple(
+        "video/x-raw",
+        "format", G_TYPE_STRING, cfg.format.c_str(),
+        "width", G_TYPE_INT, cfg.width,
+        "height", G_TYPE_INT, cfg.height,
+        nullptr);
+  }
+
+  return gst_caps_new_simple(
+      "application/vnd.simaai.tensor",
+      "format", G_TYPE_STRING, cfg.format.c_str(),
+      "width", G_TYPE_INT, cfg.width,
+      "height", G_TYPE_INT, cfg.height,
+      "depth", G_TYPE_INT, cfg.depth,
+      nullptr);
+}
+
+static void debug_pool_log(const char* msg) {
+  if (env_bool("SIMA_DEBUG_INPUT_POOL", false)) {
+    std::fprintf(stderr, "%s\n", msg);
+  }
+}
+
+static void configure_appsrc(GstElement* appsrc, const InputAppSrcOptions& opt) {
+  if (!appsrc) return;
+  g_object_set(G_OBJECT(appsrc),
+               "is-live", opt.is_live ? TRUE : FALSE,
+               "format", GST_FORMAT_TIME,
+               "do-timestamp", opt.do_timestamp ? TRUE : FALSE,
+               "block", opt.block ? TRUE : FALSE,
+               "stream-type", opt.stream_type,
+               "max-bytes", static_cast<guint64>(opt.max_bytes),
+               nullptr);
+}
+
+static void configure_appsink_for_input(GstElement* appsink) {
+  if (!appsink) return;
+  g_object_set(G_OBJECT(appsink),
+               "emit-signals", FALSE,
+               "max-buffers", 1,
+               "drop", FALSE,
+               "sync", TRUE,
+               "enable-last-sample", FALSE,
+               "qos", FALSE,
+               nullptr);
+}
+
+struct InputBufferPoolGuard {
+#if SIMA_HAS_SIMAAI_POOL
+  std::unique_ptr<GstBufferPool, decltype(&gst_simaai_free_buffer_pool)> pool{
+      nullptr, gst_simaai_free_buffer_pool};
+#else
+  std::unique_ptr<GstBufferPool, void(*)(GstBufferPool*)> pool{nullptr, +[](GstBufferPool*) {}};
+#endif
+};
+
+static GstBuffer* allocate_input_buffer(size_t bytes,
+                                        const InputAppSrcOptions& opt,
+                                        InputBufferPoolGuard& guard) {
+#if SIMA_HAS_SIMAAI_POOL
+  if (opt.use_simaai_pool) {
+    gst_simaai_segment_memory_init_once();
+    GstMemoryFlags flags = static_cast<GstMemoryFlags>(
+        GST_SIMAAI_MEMORY_TARGET_EV74 | GST_SIMAAI_MEMORY_FLAG_CACHED);
+    GstBufferPool* pool = gst_simaai_allocate_buffer_pool(
+        /*allocator_user_data=*/nullptr,
+        gst_simaai_memory_get_segment_allocator(),
+        bytes,
+        opt.pool_min_buffers,
+        opt.pool_max_buffers,
+        flags);
+    if (pool) {
+      guard.pool.reset(pool);
+      GstBuffer* buf = nullptr;
+      if (gst_buffer_pool_acquire_buffer(pool, &buf, nullptr) == GST_FLOW_OK && buf) {
+        return buf;
+      }
+      debug_pool_log("InputAppSrc: simaai pool acquired but buffer allocation failed.");
+      return nullptr;
+    }
+    debug_pool_log("InputAppSrc: simaai pool allocation failed.");
+    return nullptr;
+  }
+#else
+  (void)opt;
+  (void)guard;
+#endif
+
+  return gst_buffer_new_allocate(nullptr, bytes, nullptr);
+}
+
+static int64_t next_input_frame_id() {
+  static std::atomic<int64_t> next_id{0};
+  return next_id.fetch_add(1);
+}
+
+static void maybe_add_simaai_meta(GstBuffer* buffer,
+                                  int64_t frame_id,
+                                  const InputAppSrcOptions& opt) {
+#if SIMA_HAS_SIMAAI_POOL
+  if (!buffer || !opt.use_simaai_pool) return;
+  GstCustomMeta* meta = gst_buffer_add_custom_meta(buffer, "GstSimaMeta");
+  if (!meta) return;
+  GstStructure* s = gst_custom_meta_get_structure(meta);
+  if (!s) return;
+  gint64 phys_addr =
+      gst_simaai_segment_memory_get_phys_addr(gst_buffer_peek_memory(buffer, 0));
+  gst_structure_set(s,
+                    "buffer-id", G_TYPE_INT64, phys_addr,
+                    "buffer-name", G_TYPE_STRING, "decoder",
+                    "buffer-offset", G_TYPE_INT64, static_cast<gint64>(0),
+                    "frame-id", G_TYPE_INT64, static_cast<gint64>(frame_id),
+                    "stream-id", G_TYPE_STRING, "0",
+                    "timestamp", G_TYPE_UINT64, static_cast<guint64>(0),
+                    nullptr);
+#else
+  (void)buffer;
+  (void)frame_id;
+  (void)opt;
+#endif
+}
+
+static void maybe_update_simaai_meta_name(GstBuffer* buffer, const std::string& name) {
+#if SIMA_HAS_SIMAAI_POOL
+  if (!buffer || name.empty()) return;
+  GstCustomMeta* meta = gst_buffer_get_custom_meta(buffer, "GstSimaMeta");
+  if (!meta) return;
+  GstStructure* s = gst_custom_meta_get_structure(meta);
+  if (!s) return;
+#if defined(GST_STRUCTURE_IS_WRITABLE)
+  if (!GST_STRUCTURE_IS_WRITABLE(s)) return;
+#else
+  return;
+#endif
+  gst_structure_set(s,
+                    "buffer-name", G_TYPE_STRING, name.c_str(),
+                    nullptr);
+#else
+  (void)buffer;
+  (void)name;
+#endif
+}
+
+static FrameNV12 sample_to_nv12_copy(GstSample* sample) {
+  if (!sample) throw std::runtime_error("sample_to_nv12_copy: null sample");
+
+  pipeline_internal::SampleHolder holder(gst_sample_ref(sample));
+  std::string map_err;
+  if (!pipeline_internal::map_video_frame_read(holder, map_err)) {
+    throw std::runtime_error("sample_to_nv12_copy: " + map_err);
+  }
+
+  const GstVideoFormat fmt = GST_VIDEO_INFO_FORMAT(&holder.vinfo);
+  if (fmt != GST_VIDEO_FORMAT_NV12) {
+    throw std::runtime_error("sample_to_nv12_copy: expected NV12 caps");
+  }
+
+  FrameNV12 out;
+  out.width = static_cast<int>(GST_VIDEO_INFO_WIDTH(&holder.vinfo));
+  out.height = static_cast<int>(GST_VIDEO_INFO_HEIGHT(&holder.vinfo));
+
+  GstBuffer* buffer = gst_sample_get_buffer(sample);
+  out.pts_ns = (buffer && GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer)))
+                   ? static_cast<int64_t>(GST_BUFFER_PTS(buffer))
+                   : -1;
+  out.dts_ns = (buffer && GST_CLOCK_TIME_IS_VALID(GST_BUFFER_DTS(buffer)))
+                   ? static_cast<int64_t>(GST_BUFFER_DTS(buffer))
+                   : -1;
+  out.duration_ns = (buffer && GST_CLOCK_TIME_IS_VALID(GST_BUFFER_DURATION(buffer)))
+                        ? static_cast<int64_t>(GST_BUFFER_DURATION(buffer))
+                        : -1;
+  out.keyframe = buffer ? !GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT) : false;
+
+  const int w = out.width;
+  const int h = out.height;
+  const size_t y_bytes = static_cast<size_t>(w) * static_cast<size_t>(h);
+  const size_t uv_bytes = static_cast<size_t>(w) * static_cast<size_t>(h / 2);
+
+  out.nv12.resize(y_bytes + uv_bytes);
+
+  uint8_t* y_dst = out.nv12.data();
+  for (int row = 0; row < h; ++row) {
+    const uint8_t* y_src =
+        static_cast<const uint8_t*>(GST_VIDEO_FRAME_PLANE_DATA(&holder.frame, 0)) +
+        static_cast<size_t>(row) * static_cast<size_t>(GST_VIDEO_FRAME_PLANE_STRIDE(&holder.frame, 0));
+    std::memcpy(y_dst + static_cast<size_t>(row) * static_cast<size_t>(w), y_src, static_cast<size_t>(w));
+  }
+
+  uint8_t* uv_dst = out.nv12.data() + y_bytes;
+  for (int row = 0; row < h / 2; ++row) {
+    const uint8_t* uv_src =
+        static_cast<const uint8_t*>(GST_VIDEO_FRAME_PLANE_DATA(&holder.frame, 1)) +
+        static_cast<size_t>(row) * static_cast<size_t>(GST_VIDEO_FRAME_PLANE_STRIDE(&holder.frame, 1));
+    std::memcpy(uv_dst + static_cast<size_t>(row) * static_cast<size_t>(w), uv_src, static_cast<size_t>(w));
+  }
+
+  return out;
+}
+
 // Best-effort naming contract enforcement; optional via env.
 static void enforce_names_contract(GstElement* pipeline,
                                    const BuildResult& br) {
@@ -1210,6 +1591,7 @@ RtspServerHandle::~RtspServerHandle() { stop(); }
 RtspServerHandle::RtspServerHandle(RtspServerHandle&& o) noexcept {
   url_ = std::move(o.url_);
   impl_ = o.impl_;
+  guard_ = std::move(o.guard_);
   o.impl_ = nullptr;
 }
 
@@ -1218,6 +1600,7 @@ RtspServerHandle& RtspServerHandle::operator=(RtspServerHandle&& o) noexcept {
     stop();
     url_ = std::move(o.url_);
     impl_ = o.impl_;
+    guard_ = std::move(o.guard_);
     o.impl_ = nullptr;
   }
   return *this;
@@ -1239,6 +1622,7 @@ void RtspServerHandle::stop() {
   impl_ = nullptr;
 
   std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  guard_.reset();
 }
 
 // =====================================================================================
@@ -1269,8 +1653,14 @@ PipelineSession& PipelineSession::gst(std::string fragment) {
   return add(nodes::Gst(std::move(fragment)));
 }
 
+void PipelineSession::set_guard(std::shared_ptr<void> guard) {
+  guard_ = std::move(guard);
+}
+
 FrameStream PipelineSession::run() {
   gst_init_once();
+
+  throw_if_input_appsrc_present(nodes_, "PipelineSession::run");
 
   enforce_sink_last(nodes_);
 
@@ -1282,6 +1672,16 @@ FrameStream PipelineSession::run() {
 
   BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
   last_pipeline_ = br.pipeline_string;
+
+  std::string guard_error;
+  auto guard = guard_;
+  if (!guard) {
+    guard = pipeline_internal::acquire_simaai_guard(
+        "PipelineSession::run", last_pipeline_, /*force=*/false, &guard_error);
+    if (!guard_error.empty()) {
+      throw std::runtime_error(guard_error);
+    }
+  }
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
@@ -1321,11 +1721,14 @@ FrameStream PipelineSession::run() {
   FrameStream fs(pipeline, sink);
   fs.set_debug_pipeline(last_pipeline_);
   fs.set_diag(br.diag);   // implicit shared_ptr<DiagCtx> -> shared_ptr<void>
+  fs.set_guard(std::move(guard));
   return fs;
 }
 
 TensorStream PipelineSession::run_tensor() {
   gst_init_once();
+
+  throw_if_input_appsrc_present(nodes_, "PipelineSession::run_tensor");
 
   enforce_sink_last(nodes_);
 
@@ -1337,6 +1740,16 @@ TensorStream PipelineSession::run_tensor() {
 
   BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
   last_pipeline_ = br.pipeline_string;
+
+  std::string guard_error;
+  auto guard = guard_;
+  if (!guard) {
+    guard = pipeline_internal::acquire_simaai_guard(
+        "PipelineSession::run_tensor", last_pipeline_, /*force=*/false, &guard_error);
+    if (!guard_error.empty()) {
+      throw std::runtime_error(guard_error);
+    }
+  }
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
@@ -1376,7 +1789,192 @@ TensorStream PipelineSession::run_tensor() {
   TensorStream ts(pipeline, sink);
   ts.set_debug_pipeline(last_pipeline_);
   ts.set_diag(br.diag);
+  ts.set_guard(std::move(guard));
   return ts;
+}
+
+RunInputResult PipelineSession::run(const cv::Mat& input) {
+  gst_init_once();
+
+  enforce_sink_last(nodes_);
+
+  const InputAppSrc* src_node = nullptr;
+  require_input_appsrc(nodes_, "PipelineSession::run(input)", &src_node);
+
+  require_element("appsrc", "PipelineSession::run(input)");
+  require_element("appsink", "PipelineSession::run(input)");
+  require_element("identity", "PipelineSession::run(input)");
+
+  const bool insert_boundaries =
+      should_insert_boundaries_for_mode("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
+
+  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+  last_pipeline_ = br.pipeline_string;
+
+  std::string guard_error;
+  auto guard = guard_;
+  if (!guard) {
+    guard = pipeline_internal::acquire_simaai_guard(
+        "PipelineSession::run(input)", last_pipeline_, /*force=*/false, &guard_error);
+    if (!guard_error.empty()) {
+      throw std::runtime_error(guard_error);
+    }
+  }
+  (void)guard;
+
+  GError* err = nullptr;
+  GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
+  if (!pipeline) {
+    std::string msg = err ? err->message : "unknown";
+    if (err) g_error_free(err);
+    throw std::runtime_error(
+        "PipelineSession::run(input): gst_parse_launch failed: " + msg +
+        "\nPipeline:\n" + last_pipeline_);
+  }
+  if (err) g_error_free(err);
+
+  if (env_bool("SIMA_GST_ENFORCE_NAMES", false)) {
+    enforce_names_contract(pipeline, br);
+  }
+
+  attach_boundary_probes(pipeline, br.diag);
+
+  GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
+  if (!sink) {
+    maybe_dump_dot(pipeline, "run_input_missing_mysink");
+    stop_and_unref(pipeline);
+    throw std::runtime_error(
+        "PipelineSession::run(input): appsink 'mysink' not found.\n"
+        "Fix: add OutputAppSink() as the last node.\nPipeline:\n" +
+        last_pipeline_);
+  }
+
+  configure_appsink_for_input(sink);
+
+  GstElement* appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "mysrc");
+  if (!appsrc) {
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw std::runtime_error(
+        "PipelineSession::run(input): appsrc 'mysrc' not found.\n"
+        "Fix: add InputAppSrc() as the first node.\nPipeline:\n" +
+        last_pipeline_);
+  }
+
+  InputCapsConfig cfg = infer_input_caps(src_node->options(), input);
+  GstCaps* caps = build_input_caps(cfg);
+  gst_app_src_set_caps(GST_APP_SRC(appsrc), caps);
+  gst_caps_unref(caps);
+
+  configure_appsrc(appsrc, src_node->options());
+
+  try {
+    set_state_or_throw(pipeline, GST_STATE_PLAYING, "PipelineSession::run(input)", br.diag);
+  } catch (...) {
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw;
+  }
+
+  cv::Mat contiguous = input;
+  if (!contiguous.isContinuous()) {
+    contiguous = input.clone();
+  }
+
+  InputBufferPoolGuard pool_guard;
+  GstBuffer* buf = allocate_input_buffer(cfg.bytes, src_node->options(), pool_guard);
+  if (!buf) {
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw std::runtime_error("PipelineSession::run(input): failed to allocate GstBuffer");
+  }
+
+  GstMapInfo mi;
+  if (!gst_buffer_map(buf, &mi, GST_MAP_WRITE)) {
+    gst_buffer_unref(buf);
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw std::runtime_error("PipelineSession::run(input): failed to map GstBuffer");
+  }
+  std::memcpy(mi.data, contiguous.data, cfg.bytes);
+  gst_buffer_unmap(buf, &mi);
+  maybe_add_simaai_meta(buf, next_input_frame_id(), src_node->options());
+
+  if (gst_app_src_push_buffer(GST_APP_SRC(appsrc), buf) != GST_FLOW_OK) {
+    gst_buffer_unref(buf);
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw std::runtime_error("PipelineSession::run(input): appsrc push failed");
+  }
+
+  const int timeout_ms =
+      std::max(10, std::atoi(env_str("SIMA_GST_RUN_INPUT_TIMEOUT_MS", "10000").c_str()));
+
+  auto sample_opt =
+      pipeline_internal::try_pull_sample_sliced(pipeline, sink, timeout_ms, br.diag,
+                                                "PipelineSession::run(input)");
+
+  if (!sample_opt.has_value()) {
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw std::runtime_error("PipelineSession::run(input): timeout waiting for output");
+  }
+
+  GstSample* sample = *sample_opt;
+  GstCaps* out_caps = gst_sample_get_caps(sample);
+  const GstStructure* st = out_caps ? gst_caps_get_structure(out_caps, 0) : nullptr;
+  const char* media = st ? gst_structure_get_name(st) : nullptr;
+
+  RunInputResult out;
+  out.caps_string = pipeline_internal::gst_caps_to_string_safe(out_caps);
+  out.media_type = media ? media : "";
+
+  if (media && std::string(media) == "application/vnd.simaai.tensor") {
+    FrameTensorRef ref = pipeline_internal::sample_to_tensor_ref(sample);
+    out.kind = RunOutputKind::Tensor;
+    out.tensor = ref.to_copy();
+    out.format = ref.format;
+  } else if (media && std::string(media).rfind("video/x-raw", 0) == 0) {
+    GstVideoInfo info;
+    std::memset(&info, 0, sizeof(info));
+    if (!gst_video_info_from_caps(&info, out_caps)) {
+      gst_sample_unref(sample);
+      gst_object_unref(appsrc);
+      gst_object_unref(sink);
+      stop_and_unref(pipeline);
+      throw std::runtime_error("PipelineSession::run(input): failed to parse video caps");
+    }
+
+    const GstVideoFormat fmt = GST_VIDEO_INFO_FORMAT(&info);
+    if (fmt == GST_VIDEO_FORMAT_NV12) {
+      out.kind = RunOutputKind::FrameNV12;
+      out.frame_nv12 = sample_to_nv12_copy(sample);
+      out.format = "NV12";
+    } else {
+      FrameTensorRef ref = pipeline_internal::sample_to_tensor_ref(sample);
+      out.kind = RunOutputKind::Tensor;
+      out.tensor = ref.to_copy();
+      out.format = ref.format;
+    }
+  } else {
+    gst_sample_unref(sample);
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw std::runtime_error("PipelineSession::run(input): unsupported output caps");
+  }
+
+  gst_sample_unref(sample);
+  gst_object_unref(appsrc);
+  gst_object_unref(sink);
+  stop_and_unref(pipeline);
+  maybe_guard_sleep("PipelineSession::run(input)");
+  return out;
 }
 
 TapStream PipelineSession::run_tap(const std::string& point_name) {
@@ -1390,6 +1988,16 @@ TapStream PipelineSession::run_tap(const std::string& point_name) {
 
   BuildResult br = build_pipeline_tap(nodes_, point_name, insert_boundaries);
   last_pipeline_ = br.pipeline_string;
+
+  std::string guard_error;
+  auto guard = guard_;
+  if (!guard) {
+    guard = pipeline_internal::acquire_simaai_guard(
+        "PipelineSession::run_tap", last_pipeline_, /*force=*/false, &guard_error);
+    if (!guard_error.empty()) {
+      throw std::runtime_error(guard_error);
+    }
+  }
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
@@ -1429,6 +2037,7 @@ TapStream PipelineSession::run_tap(const std::string& point_name) {
   ts.set_debug_pipeline(last_pipeline_);
   ts.set_diag(br.diag);
   ts.set_tap_meta(br.tap_node_index, br.appsink_name);
+  ts.set_guard(std::move(guard));
   return ts;
 }
 
@@ -1436,6 +2045,14 @@ PipelineReport PipelineSession::validate(const ValidateOptions& opt) const {
   gst_init_once();
 
   PipelineReport rep;
+
+  try {
+    throw_if_input_appsrc_present(nodes_, "PipelineSession::validate");
+  } catch (const std::exception& e) {
+    rep.pipeline_string = "<input required>";
+    rep.repro_note = e.what();
+    return rep;
+  }
 
   {
     NodeGroup group(nodes_);
@@ -1467,6 +2084,18 @@ PipelineReport PipelineSession::validate(const ValidateOptions& opt) const {
 
   BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
   rep.pipeline_string = br.pipeline_string;
+
+  std::string guard_error;
+  auto guard = guard_;
+  if (!guard) {
+    guard = pipeline_internal::acquire_simaai_guard(
+        "PipelineSession::validate", rep.pipeline_string, /*force=*/false, &guard_error);
+    if (!guard_error.empty()) {
+      rep.repro_note = guard_error;
+      return rep;
+    }
+  }
+  (void)guard;
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(rep.pipeline_string.c_str(), &err);
@@ -1531,6 +2160,183 @@ PipelineReport PipelineSession::validate(const ValidateOptions& opt) const {
   return rep;
 }
 
+PipelineReport PipelineSession::validate(const ValidateOptions& opt,
+                                         const cv::Mat& input) const {
+  gst_init_once();
+
+  PipelineReport rep;
+
+  const InputAppSrc* src_node = nullptr;
+  try {
+    require_input_appsrc(nodes_, "PipelineSession::validate(input)", &src_node);
+  } catch (const std::exception& e) {
+    rep.pipeline_string = "<input required>";
+    rep.repro_note = e.what();
+    return rep;
+  }
+
+  {
+    NodeGroup group(nodes_);
+    ValidationContext ctx;
+    ctx.mode = ValidationContext::Mode::Validate;
+    ctx.strict = true;
+
+    ContractRegistry reg;
+    reg.add(validators::NonEmptyPipeline());
+    reg.add(validators::NoNullNodes());
+    reg.add(validators::UniqueDebugPointLabels());
+
+    ValidationReport vrep = reg.validate(group, ctx);
+    if (vrep.has_errors()) {
+      rep.pipeline_string = "<builder-validation failed>";
+      rep.repro_note = "validate(input): contract checks failed.\n" + vrep.to_string();
+      return rep;
+    }
+  }
+
+  if (!opt.parse_launch) {
+    rep.pipeline_string = "<parse_launch disabled>";
+    rep.repro_note = "validate(input, parse_launch=false): skipped.";
+    return rep;
+  }
+
+  const bool insert_boundaries =
+      should_insert_boundaries_for_mode("SIMA_GST_VALIDATE_INSERT_BOUNDARIES", true);
+
+  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+  rep.pipeline_string = br.pipeline_string;
+
+  std::string guard_error;
+  auto guard = guard_;
+  if (!guard) {
+    guard = pipeline_internal::acquire_simaai_guard(
+        "PipelineSession::validate(input)", rep.pipeline_string, /*force=*/false, &guard_error);
+    if (!guard_error.empty()) {
+      rep.repro_note = guard_error;
+      return rep;
+    }
+  }
+  (void)guard;
+
+  GError* err = nullptr;
+  GstElement* pipeline = gst_parse_launch(rep.pipeline_string.c_str(), &err);
+  if (!pipeline) {
+    std::string msg = err ? err->message : "unknown";
+    if (err) g_error_free(err);
+    rep.repro_note = "validate(input): gst_parse_launch failed: " + msg;
+    rep.repro_gst_launch = "gst-launch-1.0 -v '" + rep.pipeline_string + "'";
+    return rep;
+  }
+  if (err) g_error_free(err);
+
+  attach_boundary_probes(pipeline, br.diag);
+
+  if (opt.enforce_names) {
+    enforce_names_contract(pipeline, br);
+  }
+
+  GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
+  if (!sink) {
+    maybe_dump_dot(pipeline, "validate_input_missing_mysink");
+    rep.repro_note =
+        "validate(input): appsink 'mysink' not found (ensure OutputAppSink is last).";
+    stop_and_unref(pipeline);
+    return rep;
+  }
+
+  configure_appsink_for_input(sink);
+
+  GstElement* appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "mysrc");
+  if (!appsrc) {
+    rep.repro_note =
+        "validate(input): appsrc 'mysrc' not found (ensure InputAppSrc is first).";
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    return rep;
+  }
+
+  InputCapsConfig cfg = infer_input_caps(src_node->options(), input);
+  GstCaps* caps = build_input_caps(cfg);
+  gst_app_src_set_caps(GST_APP_SRC(appsrc), caps);
+  gst_caps_unref(caps);
+
+  configure_appsrc(appsrc, src_node->options());
+
+  try {
+    set_state_or_throw(pipeline, GST_STATE_PAUSED, "PipelineSession::validate(input)", br.diag);
+  } catch (const PipelineError& e) {
+    rep = e.report();
+    rep.repro_note = std::string("validate(input): failed to PAUSE/preroll.\n") + rep.repro_note;
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    return rep;
+  }
+
+  cv::Mat contiguous = input;
+  if (!contiguous.isContinuous()) {
+    contiguous = input.clone();
+  }
+
+  InputBufferPoolGuard pool_guard;
+  GstBuffer* buf = allocate_input_buffer(cfg.bytes, src_node->options(), pool_guard);
+  if (!buf) {
+    rep.repro_note = "validate(input): failed to allocate GstBuffer";
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    return rep;
+  }
+
+  GstMapInfo mi;
+  if (!gst_buffer_map(buf, &mi, GST_MAP_WRITE)) {
+    gst_buffer_unref(buf);
+    rep.repro_note = "validate(input): failed to map GstBuffer";
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    return rep;
+  }
+  std::memcpy(mi.data, contiguous.data, cfg.bytes);
+  gst_buffer_unmap(buf, &mi);
+  maybe_add_simaai_meta(buf, next_input_frame_id(), src_node->options());
+
+  if (gst_app_src_push_buffer(GST_APP_SRC(appsrc), buf) != GST_FLOW_OK) {
+    gst_buffer_unref(buf);
+    rep.repro_note = "validate(input): appsrc push failed";
+    gst_object_unref(appsrc);
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    return rep;
+  }
+  gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
+
+  const int timeout_ms =
+      std::max(10, std::atoi(env_str("SIMA_GST_VALIDATE_TIMEOUT_MS", "10000").c_str()));
+
+  GstSample* sample = nullptr;
+#if GST_CHECK_VERSION(1,10,0)
+  sample = gst_app_sink_try_pull_preroll(GST_APP_SINK(sink),
+                                        (guint64)timeout_ms * GST_MSECOND);
+#else
+  sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink),
+                                        (guint64)timeout_ms * GST_MSECOND);
+#endif
+  if (sample) gst_sample_unref(sample);
+
+  rep = br.diag->snapshot_basic();
+  rep.pipeline_string = br.pipeline_string;
+
+  rep.repro_note = sample
+      ? "validate(input): preroll OK (PAUSED)."
+      : "validate(input): preroll timed out in PAUSED.";
+
+  gst_object_unref(appsrc);
+  gst_object_unref(sink);
+  stop_and_unref(pipeline);
+  return rep;
+}
+
 RtspServerHandle PipelineSession::run_rtsp(const RtspServerOptions& opt) {
   gst_init_once();
 
@@ -1555,6 +2361,16 @@ RtspServerHandle PipelineSession::run_rtsp(const RtspServerOptions& opt) {
   }
   last_pipeline_ = "( " + ss.str() + " )";
 
+  std::string guard_error;
+  auto guard = guard_;
+  if (!guard) {
+    guard = pipeline_internal::acquire_simaai_guard(
+        "PipelineSession::run_rtsp", last_pipeline_, /*force=*/false, &guard_error);
+    if (!guard_error.empty()) {
+      throw std::runtime_error(guard_error);
+    }
+  }
+
   auto* impl = new RtspServerImpl();
   impl->port = opt.port;
   impl->mount_path = ensure_mount_path(opt.mount);
@@ -1567,6 +2383,7 @@ RtspServerHandle PipelineSession::run_rtsp(const RtspServerOptions& opt) {
   RtspServerHandle handle;
   handle.url_ = impl->url;
   handle.impl_ = impl;
+  handle.guard_ = std::move(guard);
 
   impl->th = std::thread([impl, launch = last_pipeline_]() {
     GstRTSPServer* server = gst_rtsp_server_new();
@@ -1654,6 +2471,14 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
 
   gst_init_once();
 
+  try {
+    throw_if_input_appsrc_present(nodes_, "PipelineSession::run_debug");
+  } catch (const std::exception& e) {
+    out.report.pipeline_string = "<input required>";
+    out.report.repro_note = e.what();
+    return out;
+  }
+
   std::vector<int> dbg_indices;
   std::vector<std::string> dbg_labels;
   for (size_t i = 0; i < nodes_.size(); ++i) {
@@ -1722,6 +2547,27 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
     combined << "SEG" << i << ": " << segment_strings[i];
   }
   last_pipeline_ = combined.str();
+
+  if (pipeline_internal::pipeline_uses_simaai(last_pipeline_) && segment_strings.size() > 1) {
+    out.report.pipeline_string = last_pipeline_;
+    out.report.repro_note =
+        "run_debug: multiple DebugPoint segments require multiple pipelines.\n" +
+        pipeline_internal::simaai_single_owner_error("PipelineSession::run_debug");
+    return out;
+  }
+
+  std::string guard_error;
+  auto guard = guard_;
+  if (!guard) {
+    guard = pipeline_internal::acquire_simaai_guard(
+        "PipelineSession::run_debug", last_pipeline_, /*force=*/false, &guard_error);
+    if (!guard_error.empty()) {
+      out.report.pipeline_string = last_pipeline_;
+      out.report.repro_note = guard_error;
+      return out;
+    }
+  }
+  (void)guard;
 
   auto diag = std::make_shared<DiagCtx>();
   diag->pipeline_string = last_pipeline_;
@@ -1890,6 +2736,318 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
   } catch (const std::exception& e) {
     out.report.pipeline_string = last_pipeline_;
     out.report.repro_note = std::string("run_debug: exception: ") + e.what();
+  }
+
+  cleanup();
+  return out;
+}
+
+RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt, const cv::Mat& input) {
+  RunDebugResult out;
+
+  gst_init_once();
+
+  enforce_sink_last(nodes_);
+
+  const InputAppSrc* src_node = nullptr;
+  require_input_appsrc(nodes_, "PipelineSession::run_debug(input)", &src_node);
+
+  std::vector<int> dbg_indices;
+  std::vector<std::string> dbg_labels;
+  for (size_t i = 0; i < nodes_.size(); ++i) {
+    if (nodes_[i] && nodes_[i]->kind() == "DebugPoint") {
+      std::string label = nodes_[i]->user_label();
+      if (label.empty()) label = "dbg";
+      dbg_indices.push_back(static_cast<int>(i));
+      dbg_labels.push_back(std::move(label));
+    }
+  }
+
+  if (dbg_indices.empty()) {
+    try {
+      RunInputResult r = run(input);
+      if (r.kind == RunOutputKind::FrameNV12 && r.frame_nv12.has_value()) {
+        out.first_frame = r.frame_nv12;
+      }
+      out.report.pipeline_string = last_pipeline_;
+      out.report.repro_note = "run_debug(input): OK (no DebugPoint nodes)";
+    } catch (const PipelineError& e) {
+      out.report = e.report();
+      if (out.report.repro_note.empty()) {
+        out.report.repro_note = e.what();
+      }
+    } catch (const std::exception& e) {
+      out.report.pipeline_string = last_pipeline_;
+      out.report.repro_note = std::string("run_debug(input): exception: ") + e.what();
+    }
+    return out;
+  }
+
+  std::vector<std::string> segment_producers;
+  segment_producers.reserve(dbg_indices.size());
+  for (const auto idx : dbg_indices) {
+    segment_producers.push_back(segment_producer_name(nodes_, idx));
+  }
+
+  require_element("appsink", "PipelineSession::run_debug(input)");
+  require_element("identity", "PipelineSession::run_debug(input)");
+  require_element("appsrc", "PipelineSession::run_debug(input)");
+
+  std::vector<std::string> segment_strings;
+  std::vector<std::string> sink_names;
+  std::vector<std::string> src_names;
+  segment_strings.reserve(dbg_indices.size());
+  sink_names.reserve(dbg_indices.size());
+  src_names.reserve(dbg_indices.size());
+
+  for (size_t i = 0; i < dbg_indices.size(); ++i) {
+    const std::string label = sanitize_name(dbg_labels[i]);
+    sink_names.push_back("dbg_sink_" + label + "_" + std::to_string(i));
+    src_names.push_back("dbg_src_" + std::to_string(i));
+  }
+
+  const int start_offset = 1; // skip InputAppSrc node
+  int prev = start_offset - 1;
+  for (size_t i = 0; i < dbg_indices.size(); ++i) {
+    const int start_idx = prev + 1;
+    const int end_idx = dbg_indices[i];
+    const bool with_appsrc = true; // feed input to first segment, chain via appsrc for others
+    const std::string seg = build_debug_segment(
+        nodes_, start_idx, end_idx, with_appsrc, src_names[i], sink_names[i]);
+    segment_strings.push_back(seg);
+    prev = end_idx;
+  }
+
+  std::ostringstream combined;
+  for (size_t i = 0; i < segment_strings.size(); ++i) {
+    if (i) combined << "\n";
+    combined << "SEG" << i << ": " << segment_strings[i];
+  }
+  last_pipeline_ = combined.str();
+
+  if (pipeline_internal::pipeline_uses_simaai(last_pipeline_) && segment_strings.size() > 1) {
+    out.report.pipeline_string = last_pipeline_;
+    out.report.repro_note =
+        "run_debug(input): multiple DebugPoint segments require multiple pipelines.\n" +
+        pipeline_internal::simaai_single_owner_error("PipelineSession::run_debug(input)");
+    return out;
+  }
+
+  std::string guard_error;
+  auto guard = guard_;
+  if (!guard) {
+    guard = pipeline_internal::acquire_simaai_guard(
+        "PipelineSession::run_debug(input)", last_pipeline_, /*force=*/false, &guard_error);
+    if (!guard_error.empty()) {
+      out.report.pipeline_string = last_pipeline_;
+      out.report.repro_note = guard_error;
+      return out;
+    }
+  }
+  (void)guard;
+
+  auto diag = std::make_shared<DiagCtx>();
+  diag->pipeline_string = last_pipeline_;
+  diag->node_reports.reserve(nodes_.size());
+  for (size_t i = 0; i < nodes_.size(); ++i) {
+    if (!nodes_[i]) continue;
+    NodeReport nr;
+    nr.index = static_cast<int>(i);
+    nr.kind = nodes_[i]->kind();
+    nr.user_label = nodes_[i]->user_label();
+    nr.gst_fragment = nodes_[i]->gst_fragment(static_cast<int>(i));
+    nr.elements = nodes_[i]->element_names(static_cast<int>(i));
+    diag->node_reports.push_back(std::move(nr));
+  }
+
+  std::vector<GstElement*> pipelines(segment_strings.size(), nullptr);
+  std::vector<GstElement*> sinks(segment_strings.size(), nullptr);
+  std::vector<GstElement*> srcs(segment_strings.size(), nullptr);
+  std::vector<std::string> seg_errors(segment_strings.size());
+
+  auto cleanup = [&]() {
+    for (auto* s : sinks) {
+      if (s) gst_object_unref(s);
+    }
+    for (auto* s : srcs) {
+      if (s) gst_object_unref(s);
+    }
+    for (auto*& p : pipelines) {
+      if (p) stop_and_unref(p);
+    }
+  };
+
+  try {
+    for (size_t i = 0; i < segment_strings.size(); ++i) {
+      GError* err = nullptr;
+      pipelines[i] = gst_parse_launch(segment_strings[i].c_str(), &err);
+      if (!pipelines[i]) {
+        std::string msg = err ? err->message : "unknown";
+        if (err) g_error_free(err);
+        seg_errors[i] = "gst_parse_launch failed: " + msg;
+        continue;
+      }
+      if (err) g_error_free(err);
+
+      sinks[i] = gst_bin_get_by_name(GST_BIN(pipelines[i]), sink_names[i].c_str());
+      if (!sinks[i]) {
+        seg_errors[i] = "appsink '" + sink_names[i] + "' not found";
+      }
+      configure_appsink_for_input(sinks[i]);
+
+      srcs[i] = gst_bin_get_by_name(GST_BIN(pipelines[i]), src_names[i].c_str());
+      if (!srcs[i]) {
+        if (!seg_errors[i].empty()) seg_errors[i] += "; ";
+        seg_errors[i] += "appsrc '" + src_names[i] + "' not found";
+      }
+      configure_appsrc(srcs[i], src_node->options());
+    }
+
+    for (size_t i = 0; i < pipelines.size(); ++i) {
+      if (!pipelines[i] || !seg_errors[i].empty()) continue;
+      GstStateChangeReturn r = gst_element_set_state(pipelines[i], GST_STATE_PLAYING);
+      if (r == GST_STATE_CHANGE_FAILURE) {
+        seg_errors[i] = "failed to set PLAYING";
+        continue;
+      }
+      GstState cur = GST_STATE_VOID_PENDING;
+      GstState pend = GST_STATE_VOID_PENDING;
+      GstStateChangeReturn r2 =
+          gst_element_get_state(pipelines[i], &cur, &pend, 2 * GST_SECOND);
+      if (r2 == GST_STATE_CHANGE_FAILURE) {
+        seg_errors[i] = "failed to reach PLAYING";
+      }
+    }
+
+    InputBufferPoolGuard pool_guard;
+    if (pipelines.size() > 0 && seg_errors[0].empty() && srcs[0]) {
+      InputCapsConfig cfg = infer_input_caps(src_node->options(), input);
+      GstCaps* caps = build_input_caps(cfg);
+      gst_app_src_set_caps(GST_APP_SRC(srcs[0]), caps);
+      gst_caps_unref(caps);
+
+      cv::Mat contiguous = input;
+      if (!contiguous.isContinuous()) {
+        contiguous = input.clone();
+      }
+
+      GstBuffer* buf = allocate_input_buffer(cfg.bytes, src_node->options(), pool_guard);
+      if (!buf) {
+        throw std::runtime_error("run_debug(input): failed to allocate GstBuffer");
+      }
+      GstMapInfo mi;
+      if (!gst_buffer_map(buf, &mi, GST_MAP_WRITE)) {
+        gst_buffer_unref(buf);
+        throw std::runtime_error("run_debug(input): failed to map GstBuffer");
+      }
+      std::memcpy(mi.data, contiguous.data, cfg.bytes);
+      gst_buffer_unmap(buf, &mi);
+      maybe_add_simaai_meta(buf, next_input_frame_id(), src_node->options());
+
+      if (gst_app_src_push_buffer(GST_APP_SRC(srcs[0]), buf) != GST_FLOW_OK) {
+        gst_buffer_unref(buf);
+        throw std::runtime_error("run_debug(input): appsrc push failed");
+      }
+      gst_app_src_end_of_stream(GST_APP_SRC(srcs[0]));
+    }
+
+    out.taps.clear();
+    out.taps.reserve(dbg_indices.size());
+
+    for (size_t i = 0; i < dbg_indices.size(); ++i) {
+      RunDebugTap tap;
+      tap.name = dbg_labels[i];
+
+      if (!seg_errors[i].empty()) {
+        tap.error = seg_errors[i];
+        out.taps.push_back(std::move(tap));
+        continue;
+      }
+
+      try {
+        auto sample_opt = pipeline_internal::try_pull_sample_sliced(
+            pipelines[i],
+            sinks[i],
+            opt.timeout_ms,
+            diag,
+            "PipelineSession::run_debug(input)");
+
+        if (!sample_opt.has_value()) {
+          tap.error = "timeout or EOS";
+          out.taps.push_back(std::move(tap));
+          continue;
+        }
+
+        GstSample* sample = sample_opt.value();
+        tap.packet = sample_to_tap_packet(sample, dbg_indices[i], sink_names[i]);
+
+        try {
+          tap.tensor = pipeline_internal::sample_to_tensor_ref(sample);
+          tap.last_good_tensor = tap.tensor;
+          out.tensors.emplace(tap.name, *tap.tensor);
+        } catch (...) {
+          // Best-effort tensor conversion.
+        }
+
+        if (i + 1 < dbg_indices.size() &&
+            pipelines[i + 1] && srcs[i + 1] && seg_errors[i + 1].empty()) {
+          GstCaps* caps = gst_sample_get_caps(sample);
+          if (caps) {
+            gst_app_src_set_caps(GST_APP_SRC(srcs[i + 1]), caps);
+          }
+
+          GstBuffer* buf = gst_sample_get_buffer(sample);
+          if (buf) {
+            GstBuffer* b = gst_buffer_ref(buf);
+            if (i < segment_producers.size()) {
+              maybe_update_simaai_meta_name(b, segment_producers[i]);
+            }
+            gst_app_src_push_buffer(GST_APP_SRC(srcs[i + 1]), b);
+            gst_app_src_end_of_stream(GST_APP_SRC(srcs[i + 1]));
+          }
+        }
+
+        gst_sample_unref(sample);
+        out.taps.push_back(std::move(tap));
+      } catch (const PipelineError& e) {
+        tap.error = e.what();
+        out.taps.push_back(std::move(tap));
+      } catch (const std::exception& e) {
+        tap.error = e.what();
+        out.taps.push_back(std::move(tap));
+      }
+    }
+
+    for (size_t i = 0; i < pipelines.size(); ++i) {
+      pipeline_internal::drain_bus(pipelines[i], diag, "PipelineSession::run_debug(input)");
+    }
+
+    out.report = diag->snapshot_basic();
+    out.report.pipeline_string = last_pipeline_;
+
+    bool any_error = false;
+    for (const auto& t : out.taps) {
+      if (!t.error.empty()) {
+        any_error = true;
+        break;
+      }
+    }
+    if (out.report.repro_note.empty()) {
+      out.report.repro_note = any_error
+          ? "run_debug(input): partial results (see per-tap errors)"
+          : "run_debug(input): OK";
+    }
+
+    cleanup();
+    return out;
+  } catch (const PipelineError& e) {
+    out.report = e.report();
+    if (out.report.repro_note.empty()) {
+      out.report.repro_note = e.what();
+    }
+  } catch (const std::exception& e) {
+    out.report.pipeline_string = last_pipeline_;
+    out.report.repro_note = std::string("run_debug(input): exception: ") + e.what();
   }
 
   cleanup();

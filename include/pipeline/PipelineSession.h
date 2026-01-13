@@ -17,6 +17,7 @@
 #include "sima/nodes/common/VideoConvert.h"
 #include "sima/nodes/common/VideoScale.h"
 #include "sima/nodes/io/AppSrcImage.h"
+#include "sima/nodes/io/InputAppSrc.h"
 #include "sima/nodes/io/RTSPInput.h"
 #include "sima/nodes/rtp/RtpH264Depay.h"
 #include "sima/nodes/sima/H264DecodeSima.h"
@@ -28,6 +29,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <opencv2/core/mat.hpp>
 
 namespace sima {
 
@@ -44,6 +47,7 @@ public:
 
   const std::string& url() const { return url_; }
   void stop();
+  void kill() { stop(); }
   bool running() const;
 
 private:
@@ -51,6 +55,7 @@ private:
 
   std::string url_;
   void* impl_ = nullptr;
+  std::shared_ptr<void> guard_;
 };
 
 class PipelineSession {
@@ -66,6 +71,9 @@ public:
   // Typed runner: last node must be OutputAppSink() and negotiated into NV12.
   FrameStream run();
   TensorStream run_tensor();
+  RunInputResult run(const cv::Mat& input);
+  RunDebugResult run_debug(const RunDebugOptions& opt, const cv::Mat& input);
+  PipelineReport validate(const ValidateOptions& opt, const cv::Mat& input) const;
 
   // Split at DebugPoint(point_name), ignore nodes after it, attach appsink and return TapStream.
   TapStream run_tap(const std::string& point_name);
@@ -89,6 +97,9 @@ public:
   std::string describe(const GraphPrinter::Options& opt = {}) const;
   std::string to_gst(bool insert_boundaries = false) const;
 
+  // Optional external guard for single-owner enforcement.
+  void set_guard(std::shared_ptr<void> guard);
+
   // Save/load pipeline config for reproducible runs.
   void save(const std::string& path) const;
   static PipelineSession load(const std::string& path);
@@ -98,6 +109,7 @@ public:
 private:
   std::vector<std::shared_ptr<Node>> nodes_;
   std::string last_pipeline_;
+  std::shared_ptr<void> guard_;
 };
 
 } // namespace sima

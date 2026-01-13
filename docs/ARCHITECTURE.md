@@ -135,6 +135,52 @@ The goal is to make “knobs” explicit and discoverable rather than hidden in 
 
 This module is intentionally optional and should not contaminate the core runtime path unless used.
 
+Key types:
+- `ModelMPK` — loads an MPK tarball, parses its JSON, and exposes model fragments
+- `ModelStage` — `Preprocess`, `MlaOnly`, `Postprocess`, `Full`
+- `ModelMPKOptions` — input size/format/normalization and upstream naming
+- `ModelFragment` — `{gst, elements}` pair for deterministic fragments
+
+Common usage:
+
+```cpp
+sima::mpk::ModelMPKOptions opt;
+opt.input_width = 224;
+opt.input_height = 224;
+opt.input_format = "RGB";
+opt.normalize = true;
+opt.mean = {0.485f, 0.456f, 0.406f};
+opt.stddev = {0.229f, 0.224f, 0.225f};
+
+auto model = sima::mpk::ModelMPK::load("resnet_50_mpk.tar.gz", opt);
+sima::PipelineSession p;
+p.add(sima::nodes::groups::Infer(model));
+```
+
+`ModelMPK::to_node_group(ModelStage)` returns a `NodeGroup` for a specific stage.
+The `sima::nodes::groups::{Preprocess,MLA,Postprocess,Infer}` helpers wrap that
+API and should be preferred when composing pipelines from an already-loaded model.
+
+`ModelMPK::input_appsrc_options(...)` provides caps/config for `InputAppSrc`
+when you need to feed frames or tensors into an MPK pipeline.
+
+---
+
+### `ModelSession` — MPK inference wrapper
+**Purpose:** Provide a simple, single-model inference API on top of `ModelMPK` and `PipelineSession`.
+
+Key properties:
+- owns a `PipelineSession` configured for a single MPK (full chain)
+- takes explicit preproc settings (width/height/format/normalization)
+- exposes `run_tensor()` for ML-friendly outputs
+- owns a process-level SimaAI guard (see below)
+- exposes `last_error()` for failure diagnostics
+
+`init(tar_gz, width, height, format, normalize, mean, stddev)` configures
+the EV74 preproc path for accuracy-sensitive models (e.g. ImageNet).
+
+Call `close()` (or rely on destructor) to release the guard and session resources.
+
 ---
 
 ## Runtime model (how execution works)
@@ -201,6 +247,26 @@ The common pattern is:
 * set `GST_STATE_NULL`
 * unref objects
 * apply a timeout safeguard (leak instead of hanging if necessary)
+
+---
+
+## SimaAI guard (single-owner + single-use)
+
+SimaAI plugins are not safe to run concurrently or repeatedly in the same process.
+To avoid crashes, the runtime enforces a process-level guard:
+
+- **Single-owner:** while a SimaAI pipeline is active, any new attempt returns:
+  “SimaAI pipelines are single-owner per process; spawn a child process to run another pipeline.”
+- **Single-use:** once a SimaAI pipeline has been run, any future attempts in the same process return:
+  “SimaAI pipelines are single-use per process; spawn a child process for subsequent runs.”
+
+Implementation:
+- `pipeline/internal/SimaaiGuard` tracks `in_use` and `used_once`.
+- `PipelineSession` acquires the guard unless an external guard is supplied via `set_guard()`.
+- `ModelSession` acquires the guard at `init()` and holds it for the session lifetime.
+- Guard acquisition is conditional on `pipeline_uses_simaai()` detecting simaai elements.
+
+This is a defensive constraint until the simaai plugin lifecycle supports safe re-init.
 
 ---
 
@@ -428,6 +494,7 @@ This keeps the architecture modular and prevents circular dependencies.
   * file read paths
   * group expansion equivalence (input groups)
   * tensor output path + save/load round-trip
+  * `modelsession_resnet50_guard_test` validates ModelSession accuracy and guard behavior
 
 When adding features, prefer adding tests that:
 

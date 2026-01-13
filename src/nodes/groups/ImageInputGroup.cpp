@@ -9,8 +9,12 @@
 #include "nodes/common/VideoRate.h"
 #include "nodes/common/VideoScale.h"
 #include "nodes/common/JpegDec.h"
+#include "nodes/sima/H264DecodeSima.h"
+#include "nodes/sima/H264EncodeSima.h"
+#include "nodes/sima/H264Parse.h"
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +73,31 @@ sima::NodeGroup ImageInputGroup(const ImageInputGroupOptions& opt) {
   auto caps = opt.output_caps;
   if (caps.fps <= 0) {
     caps.fps = opt.fps;
+  }
+
+  if (opt.sima_decoder.enable) {
+    if (caps.width <= 0 || caps.height <= 0) {
+      throw std::runtime_error(
+          "ImageInputGroup: sima_decoder requires output_caps.width/height");
+    }
+    if (caps.fps <= 0) {
+      throw std::runtime_error(
+          "ImageInputGroup: sima_decoder requires fps or output_caps.fps");
+    }
+
+    nodes.push_back(nodes::CapsRaw("NV12",
+                                   caps.width,
+                                   caps.height,
+                                   caps.fps,
+                                   sima::CapsMemory::SystemMemory));
+    nodes.push_back(nodes::H264EncodeSima(caps.width, caps.height, caps.fps));
+    nodes.push_back(nodes::H264Parse(/*config_interval=*/1));
+
+    const std::string out_fmt = caps.format.empty() ? "RGB" : caps.format;
+    nodes.push_back(nodes::H264Decode(opt.sima_decoder.sima_allocator_type,
+                                      out_fmt,
+                                      opt.sima_decoder.decoder_name,
+                                      opt.sima_decoder.raw_output));
   }
 
   if (caps_enabled(caps)) {

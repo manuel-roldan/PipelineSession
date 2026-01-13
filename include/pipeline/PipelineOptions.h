@@ -24,7 +24,7 @@ struct ValidateOptions {
 };
 
 struct RunDebugOptions {
-  int timeout_ms = 1000;
+  int timeout_ms = 10000;
 };
 
 struct OutputTensorOptions {
@@ -46,6 +46,23 @@ struct RunDebugTap {
   std::optional<FrameTensorRef> tensor;
   std::optional<FrameTensorRef> last_good_tensor;
   std::string error;
+};
+
+enum class RunOutputKind {
+  Tensor,
+  FrameNV12,
+  Unknown,
+};
+
+struct RunInputResult {
+  RunOutputKind kind = RunOutputKind::Unknown;
+
+  std::optional<FrameTensor> tensor;
+  std::optional<FrameNV12> frame_nv12;
+
+  std::string caps_string;
+  std::string media_type;
+  std::string format;
 };
 
 struct RunDebugResult {

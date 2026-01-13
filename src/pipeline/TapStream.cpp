@@ -292,6 +292,7 @@ TapStream& TapStream::operator=(TapStream&& o) noexcept {
   appsink_ = o.appsink_;
   debug_pipeline_ = std::move(o.debug_pipeline_);
   diag_ = std::move(o.diag_);
+  guard_ = std::move(o.guard_);
   tap_node_index_ = o.tap_node_index_;
   tap_sink_name_ = std::move(o.tap_sink_name_);
 
@@ -311,6 +312,12 @@ void TapStream::close() {
 
   pipeline_internal::stop_and_unref(appsink_);
   pipeline_internal::stop_and_unref(pipeline_);
+
+  diag_.reset();
+  debug_pipeline_.clear();
+  guard_.reset();
+  tap_node_index_ = -1;
+  tap_sink_name_.clear();
 }
 
 std::optional<TapPacket> TapStream::next(int timeout_ms) {

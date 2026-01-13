@@ -43,6 +43,13 @@ struct ImageInputGroupOptions {
   Decoder decoder = Decoder::Auto;
   std::string custom_decoder_fragment;
 
+  struct SimaDecoder {
+    bool enable = false;
+    int sima_allocator_type = 2;
+    std::string decoder_name = "decoder";
+    bool raw_output = false;
+  } sima_decoder;
+
   // Optional raw fragment inserted before ImageFreeze (advanced use)
   std::string extra_fragment;
 };

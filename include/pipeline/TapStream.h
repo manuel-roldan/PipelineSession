@@ -80,6 +80,7 @@ public:
   std::optional<TapPacket> next(int timeout_ms = 1000);
 
   void close();
+  void kill() { close(); }
 
   const std::string& debug_pipeline() const { return debug_pipeline_; }
   PipelineReport report_snapshot(bool heavy = false) const;
@@ -88,6 +89,7 @@ private:
   friend class PipelineSession;
   void set_debug_pipeline(std::string s) { debug_pipeline_ = std::move(s); }
   void set_diag(std::shared_ptr<void> diag) { diag_ = std::move(diag); }
+  void set_guard(std::shared_ptr<void> guard) { guard_ = std::move(guard); }
   void set_tap_meta(int node_index, std::string appsink_name) {
     tap_node_index_ = node_index;
     tap_sink_name_ = std::move(appsink_name);
@@ -98,6 +100,7 @@ private:
   std::string debug_pipeline_;
 
   std::shared_ptr<void> diag_; // opaque diagnostics context (pipeline_internal::DiagCtx)
+  std::shared_ptr<void> guard_;
   int tap_node_index_ = -1;
   std::string tap_sink_name_;
 };

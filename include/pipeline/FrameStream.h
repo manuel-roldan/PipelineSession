@@ -76,10 +76,12 @@ class FrameStream {
   PipelineReport report_snapshot(bool heavy) const;
 
   void close();
+  void kill() { close(); }
 
   // Debug helpers used by PipelineSession.
   void set_debug_pipeline(std::string name) { debug_pipeline_ = std::move(name); }
   void set_diag(std::shared_ptr<void> diag) { diag_ = std::move(diag); }
+  void set_guard(std::shared_ptr<void> guard) { guard_ = std::move(guard); }
 
  private:
   GstElement* pipeline_ = nullptr;
@@ -87,6 +89,7 @@ class FrameStream {
 
   std::string debug_pipeline_;
   std::shared_ptr<void> diag_;
+  std::shared_ptr<void> guard_;
 };
 
 } // namespace sima

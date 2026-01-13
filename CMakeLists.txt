@@ -21,6 +21,9 @@ pkg_check_modules(GST REQUIRED
 
 pkg_check_modules(OPENCV REQUIRED opencv4)
 
+find_library(SIMAAI_ALLOCATOR_LIB gstsimaallocator)
+find_library(SIMAAI_BUFFERPOOL_LIB gstsimaaibufferpool)
+
 add_library(pipelinesession STATIC
   src/pipeline/PipelineSession.cpp
   src/pipeline/Errors.cpp
@@ -31,6 +34,9 @@ add_library(pipelinesession STATIC
   src/pipeline/TensorStream.cpp
   src/pipeline/TensorUtil.cpp
   src/pipeline/internal/GstDiagnosticsUtil.cpp
+  src/pipeline/internal/SimaaiGuard.cpp
+  src/mpk/ModelMPK.cpp
+  src/ModelSession.cpp
   src/gst/GstBusWatch.cpp
   src/gst/GstInit.cpp
   src/gst/GstHelpers.cpp
@@ -51,6 +57,7 @@ add_library(pipelinesession STATIC
   src/nodes/common/ImageDecode.cpp
   src/nodes/io/RTSPInput.cpp
   src/nodes/io/AppSrcImage.cpp
+  src/nodes/io/InputAppSrc.cpp
   src/nodes/rtp/RtpH264Depay.cpp
   src/nodes/sima/H264DecodeSima.cpp
   src/nodes/sima/H264EncodeSima.cpp
@@ -59,6 +66,7 @@ add_library(pipelinesession STATIC
   src/nodes/groups/ImageInputGroup.cpp
   src/nodes/groups/VideoInputGroup.cpp
   src/nodes/groups/RtspInputGroup.cpp
+  src/nodes/groups/ModelGroups.cpp
 )
 
 target_include_directories(pipelinesession
@@ -72,6 +80,28 @@ target_include_directories(pipelinesession
 target_compile_options(pipelinesession PRIVATE ${GST_CFLAGS_OTHER} ${OPENCV_CFLAGS_OTHER})
 target_link_directories(pipelinesession PRIVATE ${GST_LIBRARY_DIRS} ${OPENCV_LIBRARY_DIRS})
 target_link_libraries(pipelinesession PUBLIC ${GST_LIBRARIES} ${OPENCV_LIBRARIES})
+
+if (SIMAAI_ALLOCATOR_LIB)
+  target_link_libraries(pipelinesession PUBLIC ${SIMAAI_ALLOCATOR_LIB})
+endif()
+if (SIMAAI_BUFFERPOOL_LIB)
+  target_link_libraries(pipelinesession PUBLIC ${SIMAAI_BUFFERPOOL_LIB})
+endif()
+
+# -------------------------
+# Examples
+# -------------------------
+add_executable(modelsession_resnet50_example
+  examples/modelsession_resnet50.cpp
+  examples/example_utils.cpp
+)
+target_link_libraries(modelsession_resnet50_example PRIVATE pipelinesession)
+
+add_executable(pipelinesession_resnet50_example
+  examples/pipelinesession_resnet50.cpp
+  examples/example_utils.cpp
+)
+target_link_libraries(pipelinesession_resnet50_example PRIVATE pipelinesession)
 
 # -------------------------
 # Tests
@@ -118,8 +148,14 @@ target_link_libraries(unit_image_group_runtime_test PRIVATE pipelinesession)
 add_executable(unit_tensorstream_test tests/unit_tensorstream_test.cpp)
 target_link_libraries(unit_tensorstream_test PRIVATE pipelinesession)
 
+add_executable(modelsession_resnet50_guard_test tests/modelsession_resnet50_guard_test.cpp)
+target_link_libraries(modelsession_resnet50_guard_test PRIVATE pipelinesession)
+
 add_executable(unit_pipeline_io_test tests/unit_pipeline_io_test.cpp)
 target_link_libraries(unit_pipeline_io_test PRIVATE pipelinesession)
+
+add_executable(resnet50_modelpack_test tests/resnet50_modelpack_test.cpp)
+target_link_libraries(resnet50_modelpack_test PRIVATE pipelinesession)
 
 enable_testing()
 
@@ -180,6 +216,22 @@ add_test(NAME unit_tensorstream_test
   COMMAND unit_tensorstream_test ${CMAKE_SOURCE_DIR}/test.jpg
 )
 
+add_test(NAME modelsession_resnet50_guard_test
+  COMMAND modelsession_resnet50_guard_test
+)
+
 add_test(NAME unit_pipeline_io_test
   COMMAND unit_pipeline_io_test ${CMAKE_SOURCE_DIR}/test.jpg
+)
+
+add_test(NAME resnet50_modelpack_direct
+  COMMAND resnet50_modelpack_test --goldfish --only-direct
+)
+
+add_test(NAME resnet50_modelpack_jpeg
+  COMMAND resnet50_modelpack_test --goldfish --only-jpeg
+)
+
+add_test(NAME resnet50_modelpack_rtsp
+  COMMAND resnet50_modelpack_test --goldfish --only-rtsp
 )

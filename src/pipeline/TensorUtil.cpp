@@ -16,10 +16,16 @@ struct MappedSample {
   GstVideoInfo info{};
   GstVideoFrame frame{};
   bool mapped = false;
+  GstMapInfo map{};
+  bool buffer_mapped = false;
 
   ~MappedSample() {
     if (mapped) {
       gst_video_frame_unmap(&frame);
+    }
+    if (buffer_mapped && sample) {
+      GstBuffer* buffer = gst_sample_get_buffer(sample);
+      if (buffer) gst_buffer_unmap(buffer, &map);
     }
     if (sample) {
       gst_sample_unref(sample);
@@ -55,6 +61,91 @@ FrameTensorRef sample_to_tensor_ref(GstSample* sample) {
   GstCaps* caps = gst_sample_get_caps(sample);
   if (!caps) {
     throw std::runtime_error("sample_to_tensor_ref: missing caps");
+  }
+
+  const GstStructure* st = gst_caps_get_structure(caps, 0);
+  const char* media = st ? gst_structure_get_name(st) : nullptr;
+
+  if (media && std::string(media) == "application/vnd.simaai.tensor") {
+    GstBuffer* buffer = gst_sample_get_buffer(sample);
+    if (!buffer) {
+      throw std::runtime_error("sample_to_tensor_ref: missing buffer");
+    }
+
+    auto holder = std::make_shared<MappedSample>();
+    holder->sample = gst_sample_ref(sample);
+
+    if (!gst_buffer_map(buffer, &holder->map, GST_MAP_READ)) {
+      throw std::runtime_error("sample_to_tensor_ref: gst_buffer_map failed");
+    }
+    holder->buffer_mapped = true;
+
+    int w = 0;
+    int h = 0;
+    int d = 0;
+    gst_structure_get_int(st, "width", &w);
+    gst_structure_get_int(st, "height", &h);
+    gst_structure_get_int(st, "depth", &d);
+
+    const char* fmt = gst_structure_get_string(st, "format");
+    const std::string fmt_str = fmt ? fmt : "";
+
+    size_t elem_size = 1;
+    TensorDType dtype = TensorDType::UInt8;
+    if (fmt_str == "DETESS") {
+      elem_size = sizeof(uint16_t);
+      dtype = TensorDType::UInt16;
+    } else if (fmt_str == "DETESSDEQUANT" || fmt_str == "FP32") {
+      elem_size = sizeof(float);
+      dtype = TensorDType::Float32;
+    }
+
+    const size_t bytes = holder->map.size;
+    if (elem_size == 0 || (bytes % elem_size) != 0) {
+      throw std::runtime_error("sample_to_tensor_ref: tensor size mismatch");
+    }
+    const size_t elems = bytes / elem_size;
+
+    FrameTensorRef out;
+    out.dtype = dtype;
+    out.format = fmt_str;
+    out.width = w;
+    out.height = h;
+    out.caps_string = caps_to_string(caps);
+    out.pts_ns = ts_or_minus1(GST_BUFFER_PTS(buffer));
+    out.dts_ns = ts_or_minus1(GST_BUFFER_DTS(buffer));
+    out.duration_ns = ts_or_minus1(GST_BUFFER_DURATION(buffer));
+    out.keyframe = parse_keyframe(buffer);
+    out.holder = holder;
+
+    TensorPlaneRef plane;
+    plane.data = static_cast<const uint8_t*>(holder->map.data);
+    plane.width = w;
+    plane.height = h;
+
+    if (w > 0 && h > 0 && d > 0) {
+      out.layout = TensorLayout::HWC;
+      out.shape = {h, w, d};
+      const int row_stride = static_cast<int>(w * d * elem_size);
+      plane.stride = row_stride;
+      out.strides = {row_stride, static_cast<int>(d * elem_size), static_cast<int>(elem_size)};
+    } else if (w > 0 && h > 0) {
+      out.layout = TensorLayout::HW;
+      out.shape = {h, w};
+      const int row_stride = static_cast<int>(w * elem_size);
+      plane.stride = row_stride;
+      out.strides = {row_stride, static_cast<int>(elem_size)};
+    } else {
+      out.layout = TensorLayout::Unknown;
+      out.shape = {static_cast<int64_t>(elems)};
+      plane.stride = static_cast<int>(elem_size);
+      plane.width = static_cast<int>(elems);
+      plane.height = 1;
+      out.strides = {static_cast<int>(elem_size)};
+    }
+
+    out.planes.push_back(plane);
+    return out;
   }
 
   GstVideoInfo info;

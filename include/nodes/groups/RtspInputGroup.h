@@ -16,6 +16,8 @@ struct RtspInputGroupOptions {
 
   int sima_allocator_type = 2;
   std::string out_format = "NV12";
+  std::string decoder_name;
+  bool decoder_raw_output = false;
 
   bool use_videoconvert = false;
   bool use_videoscale = false;

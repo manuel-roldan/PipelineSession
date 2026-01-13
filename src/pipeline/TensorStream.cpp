@@ -34,6 +34,7 @@ TensorStream& TensorStream::operator=(TensorStream&& other) noexcept {
   appsink_ = other.appsink_;
   debug_pipeline_ = std::move(other.debug_pipeline_);
   diag_ = std::move(other.diag_);
+  guard_ = std::move(other.guard_);
 
   other.pipeline_ = nullptr;
   other.appsink_ = nullptr;
@@ -64,6 +65,7 @@ void TensorStream::close() {
 
   diag_.reset();
   debug_pipeline_.clear();
+  guard_.reset();
 }
 
 std::optional<FrameTensorRef> TensorStream::next(int timeout_ms) {
