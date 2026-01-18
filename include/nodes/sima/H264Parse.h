@@ -2,6 +2,7 @@
 #pragma once
 
 #include "sima/builder/Node.h"
+#include "sima/builder/OutputSpec.h"
 
 #include <memory>
 #include <optional>
@@ -34,13 +35,14 @@ struct H264ParseOptions {
   bool enforce_caps = false;
 };
 
-class H264Parse final : public Node {
+class H264Parse final : public Node, public OutputSpecProvider {
 public:
   explicit H264Parse(H264ParseOptions opt = {});
   std::string kind() const override { return "H264Parse"; }
 
   std::string gst_fragment(int node_index) const override;
   std::vector<std::string> element_names(int node_index) const override;
+  OutputSpec output_spec(const OutputSpec& input) const override;
 
   const H264ParseOptions& options() const { return opt_; }
 

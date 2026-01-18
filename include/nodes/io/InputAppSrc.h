@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sima/builder/Node.h"
+#include "sima/builder/OutputSpec.h"
 
 #include <memory>
 #include <cstdint>
@@ -27,7 +28,7 @@ struct InputAppSrcOptions {
   int pool_max_buffers = 5;
 };
 
-class InputAppSrc final : public Node {
+class InputAppSrc final : public Node, public OutputSpecProvider {
 public:
   explicit InputAppSrc(InputAppSrcOptions opt);
 
@@ -36,6 +37,7 @@ public:
 
   std::string gst_fragment(int node_index) const override;
   std::vector<std::string> element_names(int node_index) const override;
+  OutputSpec output_spec(const OutputSpec& input) const override;
 
   const InputAppSrcOptions& options() const { return opt_; }
   std::string caps_string() const;

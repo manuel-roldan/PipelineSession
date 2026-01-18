@@ -88,6 +88,15 @@ std::vector<std::string> H264EncodeSima::element_names(int node_index) const {
   return {"n" + std::to_string(node_index) + "_encoder"};
 }
 
+OutputSpec H264EncodeSima::output_spec(const OutputSpec& /*input*/) const {
+  OutputSpec out;
+  out.media_type = "video/x-h264";
+  out.format = "H264";
+  out.certainty = SpecCertainty::Hint;
+  out.note = "H264 encoded stream";
+  return out;
+}
+
 } // namespace sima
 
 namespace sima::nodes {

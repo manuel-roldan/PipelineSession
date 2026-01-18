@@ -65,6 +65,15 @@ std::vector<std::string> H264Parse::element_names(int node_index) const {
   return names;
 }
 
+OutputSpec H264Parse::output_spec(const OutputSpec& /*input*/) const {
+  OutputSpec out;
+  out.media_type = "video/x-h264";
+  out.format = "H264";
+  out.certainty = SpecCertainty::Hint;
+  out.note = "H264 parse output";
+  return out;
+}
+
 } // namespace sima
 
 namespace sima::nodes {

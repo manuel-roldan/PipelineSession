@@ -21,6 +21,15 @@ std::vector<std::string> RtpH264Pay::element_names(int /*node_index*/) const {
   return {"pay0"};
 }
 
+OutputSpec RtpH264Pay::output_spec(const OutputSpec& /*input*/) const {
+  OutputSpec out;
+  out.media_type = "application/x-rtp";
+  out.format = "H264";
+  out.certainty = SpecCertainty::Hint;
+  out.note = "RTP H264 payload";
+  return out;
+}
+
 } // namespace sima
 
 namespace sima::nodes {

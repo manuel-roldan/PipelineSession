@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sima/builder/Node.h"
+#include "sima/builder/OutputSpec.h"
 
 #include <cstdint>
 #include <memory>
@@ -9,7 +10,7 @@
 
 namespace sima {
 
-class AppSrcImage final : public Node {
+class AppSrcImage final : public Node, public OutputSpecProvider {
 public:
   AppSrcImage(std::string image_path,
               int content_w,
@@ -23,6 +24,7 @@ public:
 
   std::string gst_fragment(int node_index) const override;
   std::vector<std::string> element_names(int node_index) const override;
+  OutputSpec output_spec(const OutputSpec& input) const override;
 
   const std::string& image_path() const { return image_path_; }
   int content_w() const { return content_w_; }

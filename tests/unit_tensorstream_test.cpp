@@ -15,6 +15,7 @@ int main(int argc, char** argv) {
 
     sima::nodes::groups::ImageInputGroupOptions opt;
     opt.path = path;
+    opt.use_videoscale = true;
     opt.output_caps.width = 64;
     opt.output_caps.height = 64;
 

@@ -25,7 +25,9 @@ find_library(SIMAAI_ALLOCATOR_LIB gstsimaallocator)
 find_library(SIMAAI_BUFFERPOOL_LIB gstsimaaibufferpool)
 
 add_library(pipelinesession STATIC
+  src/builder/OutputSpec.cpp
   src/pipeline/PipelineSession.cpp
+  src/pipeline/DebugOverloads.cpp
   src/pipeline/Errors.cpp
   src/pipeline/PipelineReport.cpp
   src/pipeline/TapStream.cpp
@@ -63,7 +65,11 @@ add_library(pipelinesession STATIC
   src/nodes/sima/H264EncodeSima.cpp
   src/nodes/sima/H264Parse.cpp
   src/nodes/sima/RtpH264Pay.cpp
+  src/nodes/sima/SimaBoxDecode.cpp
+  src/nodes/sima/SimaArgMax.cpp
+  src/nodes/sima/SimaRender.cpp
   src/nodes/groups/ImageInputGroup.cpp
+  src/nodes/groups/GroupOutputSpec.cpp
   src/nodes/groups/VideoInputGroup.cpp
   src/nodes/groups/RtspInputGroup.cpp
   src/nodes/groups/ModelGroups.cpp
@@ -103,6 +109,17 @@ add_executable(pipelinesession_resnet50_example
 )
 target_link_libraries(pipelinesession_resnet50_example PRIVATE pipelinesession)
 
+add_executable(midas_v21_rtsp_example
+  examples/midas_v21_rtsp.cpp
+  examples/example_utils.cpp
+)
+target_link_libraries(midas_v21_rtsp_example PRIVATE pipelinesession)
+
+add_executable(resnet50_debug_overloads_example
+  examples/resnet50_debug_overloads.cpp
+)
+target_link_libraries(resnet50_debug_overloads_example PRIVATE pipelinesession)
+
 # -------------------------
 # Tests
 # -------------------------
@@ -120,6 +137,12 @@ target_link_libraries(unit_builder_test PRIVATE pipelinesession)
 
 add_executable(unit_contracts_test tests/unit_contracts_test.cpp)
 target_link_libraries(unit_contracts_test PRIVATE pipelinesession)
+
+add_executable(unit_outputspec_test tests/unit_outputspec_test.cpp)
+target_link_libraries(unit_outputspec_test PRIVATE pipelinesession)
+
+add_executable(unit_sima_plugins_test tests/unit_sima_plugins_test.cpp)
+target_link_libraries(unit_sima_plugins_test PRIVATE pipelinesession)
 
 add_executable(unit_nodes_test tests/unit_nodes_test.cpp)
 target_link_libraries(unit_nodes_test PRIVATE pipelinesession)
@@ -144,6 +167,9 @@ target_link_libraries(unit_groups_test PRIVATE pipelinesession)
 
 add_executable(unit_image_group_runtime_test tests/unit_image_group_runtime_test.cpp)
 target_link_libraries(unit_image_group_runtime_test PRIVATE pipelinesession)
+
+add_executable(unit_debug_overloads_test tests/unit_debug_overloads_test.cpp)
+target_link_libraries(unit_debug_overloads_test PRIVATE pipelinesession)
 
 add_executable(unit_tensorstream_test tests/unit_tensorstream_test.cpp)
 target_link_libraries(unit_tensorstream_test PRIVATE pipelinesession)
@@ -183,6 +209,14 @@ add_test(NAME unit_contracts_test
   COMMAND unit_contracts_test
 )
 
+add_test(NAME unit_outputspec_test
+  COMMAND unit_outputspec_test
+)
+
+add_test(NAME unit_sima_plugins_test
+  COMMAND unit_sima_plugins_test
+)
+
 add_test(NAME unit_nodes_test
   COMMAND unit_nodes_test
 )
@@ -213,6 +247,10 @@ add_test(NAME unit_groups_test
 
 add_test(NAME unit_image_group_runtime_test
   COMMAND unit_image_group_runtime_test ${CMAKE_SOURCE_DIR}/test.jpg
+)
+
+add_test(NAME unit_debug_overloads_test
+  COMMAND unit_debug_overloads_test ${CMAKE_SOURCE_DIR}/test.jpg
 )
 
 add_test(NAME unit_tensorstream_test

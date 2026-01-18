@@ -167,6 +167,24 @@ std::vector<std::string> AppSrcImage::element_names(int node_index) const {
   return {"mysrc", "n" + std::to_string(node_index) + "_queue"};
 }
 
+OutputSpec AppSrcImage::output_spec(const OutputSpec& /*input*/) const {
+  OutputSpec out;
+  out.media_type = "video/x-raw";
+  out.format = "NV12";
+  out.width = enc_w_;
+  out.height = enc_h_;
+  out.depth = 0;
+  out.fps_num = fps_;
+  out.fps_den = 1;
+  out.layout = "Planar";
+  out.dtype = "UInt8";
+  out.memory = "SystemMemory";
+  out.certainty = SpecCertainty::Derived;
+  out.note = "AppSrcImage (NV12)";
+  out.byte_size = expected_byte_size(out);
+  return out;
+}
+
 } // namespace sima
 
 namespace sima::nodes {

@@ -68,6 +68,19 @@ std::vector<std::string> H264Decode::element_names(int node_index) const {
           "n" + std::to_string(node_index) + "_raw_caps"};
 }
 
+OutputSpec H264Decode::output_spec(const OutputSpec& /*input*/) const {
+  OutputSpec out;
+  out.media_type = "video/x-raw";
+  out.format = out_format_.empty() ? "NV12" : out_format_;
+  out.layout = (out.format == "NV12" || out.format == "I420") ? "Planar" : "HWC";
+  out.dtype = "UInt8";
+  out.memory = raw_output_ ? "SimaAI" : "SystemMemory";
+  out.certainty = SpecCertainty::Hint;
+  out.note = "H264Decode output";
+  out.byte_size = expected_byte_size(out);
+  return out;
+}
+
 } // namespace sima
 
 namespace sima::nodes {

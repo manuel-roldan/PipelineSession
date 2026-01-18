@@ -293,6 +293,8 @@ static sima::FrameTensor run_image_group_infer(const sima::mpk::ModelMPK& model,
   opt.path = image_path;
   opt.imagefreeze_num_buffers = 8;
   opt.fps = fps;
+  opt.use_videorate = true;
+  opt.use_videoscale = true;
   opt.output_caps.enable = true;
   opt.output_caps.format = "NV12";
   opt.output_caps.width = w;

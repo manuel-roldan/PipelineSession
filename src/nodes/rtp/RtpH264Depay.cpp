@@ -35,6 +35,15 @@ std::vector<std::string> RtpH264Depay::element_names(int node_index) const {
   };
 }
 
+OutputSpec RtpH264Depay::output_spec(const OutputSpec& /*input*/) const {
+  OutputSpec out;
+  out.media_type = "video/x-h264";
+  out.format = "H264";
+  out.certainty = SpecCertainty::Hint;
+  out.note = "RTP depay -> H264";
+  return out;
+}
+
 } // namespace sima
 
 namespace sima::nodes {

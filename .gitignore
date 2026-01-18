@@ -25,3 +25,10 @@ CTestTestfile.cmake
 
 # logs
 *.log
+
+# media / temp
+*.mp4
+*.mov
+*.mkv
+*.avi
+tmp/

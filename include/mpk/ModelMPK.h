@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sima/builder/NodeGroup.h"
+#include "sima/builder/OutputSpec.h"
 #include "sima/nodes/io/InputAppSrc.h"
 
 #include <cstdint>
@@ -24,6 +25,9 @@ struct ModelMPKOptions {
   // Override the upstream buffer name used in MPK JSONs (e.g. "decoder").
   std::string upstream_name;
 };
+
+ModelMPKOptions options_from_output_spec(const sima::OutputSpec& spec,
+                                         const ModelMPKOptions& base = {});
 
 enum class ModelStage { Preprocess, MlaOnly, Postprocess, Full };
 

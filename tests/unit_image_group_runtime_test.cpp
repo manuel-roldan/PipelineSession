@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
     opt.path = argv[1];
     opt.imagefreeze_num_buffers = 5;
     opt.fps = 30;
+    opt.use_videoscale = true;
     opt.output_caps.width = 64;
     opt.output_caps.height = 64;
 

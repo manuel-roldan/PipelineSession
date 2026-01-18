@@ -1,5 +1,7 @@
 #include "nodes/common/Caps.h"
 
+#include "builder/OutputSpec.h"
+
 #include <cctype>
 #include <memory>
 #include <sstream>
@@ -102,7 +104,7 @@ private:
   std::string fragment_;
 };
 
-class CapsRawNode final : public sima::Node {
+class CapsRawNode final : public sima::Node, public sima::OutputSpecProvider {
 public:
   CapsRawNode(std::string format, int w, int h, int fps, sima::CapsMemory mem)
       : format_(std::move(format)), w_(w), h_(h), fps_(fps), mem_(mem) {}
@@ -127,6 +129,36 @@ public:
 
   std::vector<std::string> element_names(int node_index) const override {
     return {"n" + std::to_string(node_index) + "_caps"};
+  }
+
+  sima::OutputSpec output_spec(const sima::OutputSpec& input) const override {
+    sima::OutputSpec out = input;
+    out.media_type = "video/x-raw";
+    if (!format_.empty()) out.format = format_;
+    if (w_ > 0) out.width = w_;
+    if (h_ > 0) out.height = h_;
+    if (fps_ > 0) {
+      out.fps_num = fps_;
+      out.fps_den = 1;
+    }
+    out.memory = (mem_ == sima::CapsMemory::SystemMemory) ? "SystemMemory" : out.memory;
+    out.dtype = "UInt8";
+    if (out.format == "RGB" || out.format == "BGR") {
+      out.layout = "HWC";
+      out.depth = 3;
+    }
+    if (out.format == "GRAY8") {
+      out.layout = "HW";
+      out.depth = 1;
+    }
+    if (out.format == "NV12" || out.format == "I420") {
+      out.layout = "Planar";
+    }
+    out.certainty = sima::SpecCertainty::Derived;
+    out.note = "CapsRaw";
+    out.byte_size = 0;
+    out.byte_size = sima::expected_byte_size(out);
+    return out;
   }
 
 private:

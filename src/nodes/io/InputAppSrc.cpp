@@ -70,6 +70,39 @@ std::vector<std::string> InputAppSrc::element_names(int /*node_index*/) const {
   return {"mysrc"};
 }
 
+OutputSpec InputAppSrc::output_spec(const OutputSpec& /*input*/) const {
+  OutputSpec out;
+  out.media_type = opt_.media_type.empty() ? "video/x-raw" : opt_.media_type;
+  out.format = opt_.format;
+  out.width = opt_.width;
+  out.height = opt_.height;
+  out.depth = opt_.depth;
+  out.certainty = SpecCertainty::Derived;
+  out.note = "InputAppSrc options";
+
+  if (out.media_type == "video/x-raw") {
+    out.dtype = "UInt8";
+    if (out.format == "RGB" || out.format == "BGR") {
+      out.layout = "HWC";
+      if (out.depth <= 0) out.depth = 3;
+    } else if (out.format == "GRAY8") {
+      out.layout = "HW";
+      if (out.depth <= 0) out.depth = 1;
+    } else if (out.format == "NV12" || out.format == "I420") {
+      out.layout = "Planar";
+    }
+  } else if (out.media_type == "application/vnd.simaai.tensor") {
+    if (out.format == "FP32") out.dtype = "Float32";
+    if (out.depth > 0 && out.width > 0 && out.height > 0) {
+      out.layout = "HWC";
+    }
+  }
+
+  out.memory = opt_.use_simaai_pool ? "SimaAI" : "SystemMemory";
+  out.byte_size = expected_byte_size(out);
+  return out;
+}
+
 } // namespace sima
 
 namespace sima::nodes {

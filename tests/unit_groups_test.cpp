@@ -69,9 +69,9 @@ int main() {
     manual_img.push_back(sima::nodes::ImageDecode());
     manual_img.push_back(sima::nodes::DebugPoint(io.debug.decoded_name));
     manual_img.push_back(sima::nodes::ImageFreeze(io.imagefreeze_num_buffers));
-    manual_img.push_back(sima::nodes::VideoRate());
-    manual_img.push_back(sima::nodes::VideoConvert());
-    manual_img.push_back(sima::nodes::VideoScale());
+    if (io.use_videorate) manual_img.push_back(sima::nodes::VideoRate());
+    if (io.use_videoconvert) manual_img.push_back(sima::nodes::VideoConvert());
+    if (io.use_videoscale) manual_img.push_back(sima::nodes::VideoScale());
     int img_fps = io.output_caps.fps > 0 ? io.output_caps.fps : io.fps;
     manual_img.push_back(sima::nodes::CapsRaw(io.output_caps.format,
                                                io.output_caps.width,
@@ -128,7 +128,10 @@ int main() {
     manual_rtsp.push_back(sima::nodes::H264DepayParse(ro.payload_type));
     manual_rtsp.push_back(sima::nodes::DebugPoint(ro.debug.encoded_name));
     manual_rtsp.push_back(sima::nodes::Queue());
-    manual_rtsp.push_back(sima::nodes::H264Decode(ro.sima_allocator_type, ro.out_format));
+    manual_rtsp.push_back(sima::nodes::H264Decode(ro.sima_allocator_type,
+                                                  ro.out_format,
+                                                  ro.decoder_name,
+                                                  ro.decoder_raw_output));
     manual_rtsp.push_back(sima::nodes::DebugPoint(ro.debug.decoded_name));
     manual_rtsp.push_back(sima::nodes::DebugPoint(ro.debug.normalized_name));
 

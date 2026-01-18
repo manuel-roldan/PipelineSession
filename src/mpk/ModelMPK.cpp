@@ -672,4 +672,25 @@ InputAppSrcOptions ModelMPK::input_appsrc_options(bool tensor_mode) const {
   return opt;
 }
 
+ModelMPKOptions options_from_output_spec(const sima::OutputSpec& spec,
+                                         const ModelMPKOptions& base) {
+  ModelMPKOptions out = base;
+
+  if (spec.width > 0) out.input_width = spec.width;
+  if (spec.height > 0) out.input_height = spec.height;
+  if (spec.depth > 0) out.input_depth = spec.depth;
+
+  const bool is_tensor = (spec.media_type == "application/vnd.simaai.tensor");
+  if (!is_tensor && !spec.format.empty()) {
+    std::string fmt = to_upper(spec.format);
+    if (fmt == "GRAY8") fmt = "GRAY";
+    if (fmt == "I420") fmt = "IYUV";
+    out.input_format = fmt;
+    if (out.input_depth == 0 && (fmt == "GRAY" || fmt == "GRAY8")) out.input_depth = 1;
+    if (out.input_depth == 0 && (fmt == "RGB" || fmt == "BGR")) out.input_depth = 3;
+  }
+
+  return out;
+}
+
 } // namespace sima::mpk

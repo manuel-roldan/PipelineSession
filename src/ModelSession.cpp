@@ -1,17 +1,292 @@
 #include "ModelSession.hpp"
 
+#include "gst/GstHelpers.h"
+#include "gst/GstInit.h"
 #include "nodes/io/InputAppSrc.h"
+#include "pipeline/internal/GstDiagnosticsUtil.h"
 #include "pipeline/internal/SimaaiGuard.h"
+#include "pipeline/internal/TensorUtil.h"
+
+#include <gst/app/gstappsink.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/gst.h>
 
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
+#if __has_include(<simaai/gstsimaaibufferpool.h>)
+#include <simaai/gstsimaaibufferpool.h>
+#define SIMA_HAS_SIMAAI_POOL 1
+#else
+#define SIMA_HAS_SIMAAI_POOL 0
+#endif
+
 namespace simaai {
 namespace {
+
+std::string upper_copy(std::string s) {
+  for (char& c : s) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return s;
+}
+
+struct InputCapsConfig {
+  std::string media_type;
+  std::string format;
+  int width = -1;
+  int height = -1;
+  int depth = -1;
+  size_t bytes = 0;
+};
+
+InputCapsConfig infer_input_caps(const sima::InputAppSrcOptions& opt,
+                                 const cv::Mat& input) {
+  if (input.empty()) {
+    throw std::invalid_argument("ModelSession::run_tensor: input frame is empty");
+  }
+
+  InputCapsConfig out;
+  out.media_type = opt.media_type.empty() ? "video/x-raw" : opt.media_type;
+
+  const int in_w = input.cols;
+  const int in_h = input.rows;
+  const int in_c = input.channels();
+
+  const bool is_video = (out.media_type == "video/x-raw");
+  const bool is_tensor = (out.media_type == "application/vnd.simaai.tensor");
+
+  if (!is_video && !is_tensor) {
+    throw std::invalid_argument(
+        "ModelSession::run_tensor: unsupported media_type: " + out.media_type);
+  }
+
+  std::string fmt = upper_copy(opt.format);
+  if (is_video) {
+    if (fmt.empty()) {
+      fmt = (in_c == 1) ? "GRAY8" : "BGR";
+    }
+    if (fmt == "GRAY") fmt = "GRAY8";
+
+    if (fmt != "RGB" && fmt != "BGR" && fmt != "GRAY8") {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: unsupported video format: " + fmt);
+    }
+
+    if ((fmt == "RGB" || fmt == "BGR") && input.type() != CV_8UC3) {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: expected CV_8UC3 for video/x-raw " + fmt);
+    }
+    if (fmt == "GRAY8" && input.type() != CV_8UC1) {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: expected CV_8UC1 for video/x-raw GRAY8");
+    }
+
+    out.width = (opt.width > 0) ? opt.width : in_w;
+    out.height = (opt.height > 0) ? opt.height : in_h;
+    if (opt.width > 0 && opt.width != in_w) {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: input width does not match InputAppSrcOptions");
+    }
+    if (opt.height > 0 && opt.height != in_h) {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: input height does not match InputAppSrcOptions");
+    }
+  } else {
+    if (fmt.empty()) fmt = "FP32";
+    if (fmt != "FP32") {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: only FP32 tensor input is supported");
+    }
+    if (input.type() != CV_32FC1 && input.type() != CV_32FC3) {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: tensor input must be CV_32FC1 or CV_32FC3");
+    }
+    out.width = (opt.width > 0) ? opt.width : in_w;
+    out.height = (opt.height > 0) ? opt.height : in_h;
+    out.depth = (opt.depth > 0) ? opt.depth : in_c;
+    if (opt.width > 0 && opt.width != in_w) {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: tensor input width does not match InputAppSrcOptions");
+    }
+    if (opt.height > 0 && opt.height != in_h) {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: tensor input height does not match InputAppSrcOptions");
+    }
+    if (opt.depth > 0 && opt.depth != in_c) {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: tensor input depth does not match InputAppSrcOptions");
+    }
+  }
+
+  out.format = fmt;
+  out.bytes = input.total() * input.elemSize();
+  return out;
+}
+
+bool caps_equal(const InputCapsConfig& a, const InputCapsConfig& b) {
+  return a.media_type == b.media_type &&
+         a.format == b.format &&
+         a.width == b.width &&
+         a.height == b.height &&
+         a.depth == b.depth &&
+         a.bytes == b.bytes;
+}
+
+GstCaps* build_input_caps(const InputCapsConfig& cfg) {
+  if (cfg.media_type == "video/x-raw") {
+    return gst_caps_new_simple(
+        "video/x-raw",
+        "format", G_TYPE_STRING, cfg.format.c_str(),
+        "width", G_TYPE_INT, cfg.width,
+        "height", G_TYPE_INT, cfg.height,
+        nullptr);
+  }
+
+  return gst_caps_new_simple(
+      "application/vnd.simaai.tensor",
+      "format", G_TYPE_STRING, cfg.format.c_str(),
+      "width", G_TYPE_INT, cfg.width,
+      "height", G_TYPE_INT, cfg.height,
+      "depth", G_TYPE_INT, cfg.depth,
+      nullptr);
+}
+
+void configure_appsrc(GstElement* appsrc, const sima::InputAppSrcOptions& opt) {
+  if (!appsrc) return;
+  g_object_set(G_OBJECT(appsrc),
+               "is-live", opt.is_live ? TRUE : FALSE,
+               "format", GST_FORMAT_TIME,
+               "do-timestamp", opt.do_timestamp ? TRUE : FALSE,
+               "block", opt.block ? TRUE : FALSE,
+               "stream-type", opt.stream_type,
+               "max-bytes", static_cast<guint64>(opt.max_bytes),
+               nullptr);
+}
+
+void configure_appsink_for_input(GstElement* appsink) {
+  if (!appsink) return;
+  g_object_set(G_OBJECT(appsink),
+               "emit-signals", FALSE,
+               "max-buffers", 1,
+               "drop", FALSE,
+               "sync", TRUE,
+               "enable-last-sample", FALSE,
+               "qos", FALSE,
+               nullptr);
+}
+
+struct InputBufferPoolGuard {
+#if SIMA_HAS_SIMAAI_POOL
+  std::unique_ptr<GstBufferPool, decltype(&gst_simaai_free_buffer_pool)> pool{
+      nullptr, gst_simaai_free_buffer_pool};
+#else
+  std::unique_ptr<GstBufferPool, void(*)(GstBufferPool*)> pool{nullptr, +[](GstBufferPool*) {}};
+#endif
+};
+
+GstBuffer* allocate_input_buffer(size_t bytes,
+                                 const sima::InputAppSrcOptions& opt,
+                                 InputBufferPoolGuard& guard) {
+#if SIMA_HAS_SIMAAI_POOL
+  if (opt.use_simaai_pool) {
+    GstBufferPool* pool = guard.pool.get();
+    if (!pool) {
+      gst_simaai_segment_memory_init_once();
+      GstMemoryFlags flags = static_cast<GstMemoryFlags>(
+          GST_SIMAAI_MEMORY_TARGET_EV74 | GST_SIMAAI_MEMORY_FLAG_CACHED);
+      GstBufferPool* new_pool = gst_simaai_allocate_buffer_pool(
+          /*allocator_user_data=*/nullptr,
+          gst_simaai_memory_get_segment_allocator(),
+          bytes,
+          opt.pool_min_buffers,
+          opt.pool_max_buffers,
+          flags);
+      if (new_pool) {
+        guard.pool.reset(new_pool);
+        pool = new_pool;
+      }
+    }
+
+    if (pool) {
+      GstBuffer* buf = nullptr;
+      if (gst_buffer_pool_acquire_buffer(pool, &buf, nullptr) == GST_FLOW_OK && buf) {
+        return buf;
+      }
+      return nullptr;
+    }
+    return nullptr;
+  }
+#else
+  (void)opt;
+  (void)guard;
+#endif
+
+  return gst_buffer_new_allocate(nullptr, bytes, nullptr);
+}
+
+int64_t next_input_frame_id() {
+  static std::atomic<int64_t> next_id{0};
+  return next_id.fetch_add(1);
+}
+
+void maybe_add_simaai_meta(GstBuffer* buffer,
+                           int64_t frame_id,
+                           const sima::InputAppSrcOptions& opt) {
+#if SIMA_HAS_SIMAAI_POOL
+  if (!buffer || !opt.use_simaai_pool) return;
+  GstCustomMeta* meta = gst_buffer_add_custom_meta(buffer, "GstSimaMeta");
+  if (!meta) return;
+  GstStructure* s = gst_custom_meta_get_structure(meta);
+  if (!s) return;
+  gint64 phys_addr =
+      gst_simaai_segment_memory_get_phys_addr(gst_buffer_peek_memory(buffer, 0));
+  gst_structure_set(s,
+                    "buffer-id", G_TYPE_INT64, phys_addr,
+                    "buffer-name", G_TYPE_STRING, "decoder",
+                    "buffer-offset", G_TYPE_INT64, static_cast<gint64>(0),
+                    "frame-id", G_TYPE_INT64, static_cast<gint64>(frame_id),
+                    "stream-id", G_TYPE_STRING, "0",
+                    "timestamp", G_TYPE_UINT64, static_cast<guint64>(0),
+                    nullptr);
+#else
+  (void)buffer;
+  (void)frame_id;
+  (void)opt;
+#endif
+}
+
+void set_state_or_throw(GstElement* pipeline,
+                        GstState target,
+                        const char* where) {
+  if (!pipeline) {
+    throw std::runtime_error(std::string(where) + ": pipeline is null");
+  }
+
+  GstStateChangeReturn r = gst_element_set_state(pipeline, target);
+  if (r == GST_STATE_CHANGE_FAILURE) {
+    sima::pipeline_internal::maybe_dump_dot(pipeline,
+                                            std::string(where) + "_set_state_failure");
+    throw std::runtime_error(std::string(where) + ": failed to set state");
+  }
+
+  GstState cur = GST_STATE_VOID_PENDING;
+  GstState pend = GST_STATE_VOID_PENDING;
+  gst_element_get_state(pipeline, &cur, &pend, 2 * GST_SECOND);
+
+  sima::pipeline_internal::drain_bus(pipeline, nullptr, where);
+  sima::pipeline_internal::throw_if_bus_error(pipeline, nullptr, where);
+}
 
 cv::Mat tensor_to_mat(const sima::FrameTensor& t) {
   if (t.planes.empty()) {
@@ -34,6 +309,23 @@ cv::Mat tensor_to_mat(const sima::FrameTensor& t) {
 }
 
 } // namespace
+
+struct ModelSession::StreamState {
+  sima::InputAppSrcOptions src_opt;
+  InputCapsConfig caps;
+  bool caps_set = false;
+
+  GstElement* pipeline = nullptr;
+  GstElement* appsrc = nullptr;
+  GstElement* appsink = nullptr;
+
+  InputBufferPoolGuard pool_guard;
+  std::string pipeline_string;
+};
+
+ModelSession::ModelSession() = default;
+ModelSession::ModelSession(ModelSession&&) noexcept = default;
+ModelSession& ModelSession::operator=(ModelSession&&) noexcept = default;
 
 ModelSession::~ModelSession() {
   close();
@@ -68,6 +360,7 @@ bool ModelSession::init(const std::string& tar_gz,
 void ModelSession::build_session(const std::string& tar_gz,
                                  const sima::nodes::groups::InferOptions& opt,
                                  bool tensor_mode) {
+  teardown_stream();
   tensor_mode_ = tensor_mode;
   initialized_ = false;
   last_error_.clear();
@@ -85,9 +378,10 @@ void ModelSession::build_session(const std::string& tar_gz,
   sima::PipelineSession sess;
   sess.set_guard(guard);
 
+  sima::InputAppSrcOptions src_opt;
   if (tensor_mode) {
     pack_ = sima::mpk::ModelMPK::load(tar_gz);
-    sima::InputAppSrcOptions src_opt = pack_.input_appsrc_options(/*tensor_mode=*/true);
+    src_opt = pack_.input_appsrc_options(/*tensor_mode=*/true);
     sess.add(sima::nodes::InputAppSrc(src_opt));
     sess.add(pack_.to_node_group(sima::mpk::ModelStage::Full));
   } else {
@@ -101,7 +395,7 @@ void ModelSession::build_session(const std::string& tar_gz,
             opt.input_height,
             opt.input_format,
             0});
-    sima::InputAppSrcOptions src_opt = pack_.input_appsrc_options(/*tensor_mode=*/false);
+    src_opt = pack_.input_appsrc_options(/*tensor_mode=*/false);
     sess.add(sima::nodes::InputAppSrc(src_opt));
     sess.add(pack_.to_node_group(sima::mpk::ModelStage::Full));
   }
@@ -109,7 +403,105 @@ void ModelSession::build_session(const std::string& tar_gz,
   sess.add(sima::nodes::OutputAppSink());
   session_ = std::move(sess);
   guard_ = std::move(guard);
+  stream_ = std::make_unique<StreamState>();
+  stream_->src_opt = src_opt;
   initialized_ = true;
+}
+
+void ModelSession::ensure_stream(const cv::Mat& input) {
+  if (!stream_) {
+    stream_ = std::make_unique<StreamState>();
+    stream_->src_opt = pack_.input_appsrc_options(tensor_mode_);
+  }
+
+  InputCapsConfig cfg = infer_input_caps(stream_->src_opt, input);
+
+  if (stream_->pipeline) {
+    if (!caps_equal(cfg, stream_->caps)) {
+      throw std::invalid_argument(
+          "ModelSession::run_tensor: input caps changed; re-init ModelSession");
+    }
+    return;
+  }
+
+  sima::gst_init_once();
+  sima::require_element("appsrc", "ModelSession::run_tensor");
+  sima::require_element("appsink", "ModelSession::run_tensor");
+  sima::require_element("identity", "ModelSession::run_tensor");
+
+  const bool insert_boundaries =
+      sima::pipeline_internal::env_bool("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
+  std::string pipeline_str = session_.to_gst(insert_boundaries);
+  stream_->pipeline_string = pipeline_str;
+
+  GError* err = nullptr;
+  GstElement* pipeline = gst_parse_launch(pipeline_str.c_str(), &err);
+  if (!pipeline) {
+    std::string msg = err ? err->message : "unknown";
+    if (err) g_error_free(err);
+    throw std::runtime_error(
+        "ModelSession::run_tensor: gst_parse_launch failed: " + msg +
+        "\nPipeline:\n" + pipeline_str);
+  }
+  if (err) g_error_free(err);
+
+  GstElement* appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "mysrc");
+  if (!appsrc) {
+    sima::pipeline_internal::stop_and_unref(pipeline);
+    throw std::runtime_error(
+        "ModelSession::run_tensor: appsrc 'mysrc' not found.\nPipeline:\n" +
+        pipeline_str);
+  }
+
+  GstElement* appsink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
+  if (!appsink) {
+    gst_object_unref(appsrc);
+    sima::pipeline_internal::stop_and_unref(pipeline);
+    throw std::runtime_error(
+        "ModelSession::run_tensor: appsink 'mysink' not found.\nPipeline:\n" +
+        pipeline_str);
+  }
+
+  GstCaps* caps = build_input_caps(cfg);
+  gst_app_src_set_caps(GST_APP_SRC(appsrc), caps);
+  gst_caps_unref(caps);
+
+  configure_appsrc(appsrc, stream_->src_opt);
+  configure_appsink_for_input(appsink);
+
+  try {
+    set_state_or_throw(pipeline, GST_STATE_PLAYING, "ModelSession::run_tensor");
+  } catch (...) {
+    gst_object_unref(appsrc);
+    gst_object_unref(appsink);
+    sima::pipeline_internal::stop_and_unref(pipeline);
+    throw;
+  }
+
+  stream_->pipeline = pipeline;
+  stream_->appsrc = appsrc;
+  stream_->appsink = appsink;
+  stream_->caps = cfg;
+  stream_->caps_set = true;
+}
+
+void ModelSession::teardown_stream() {
+  if (!stream_) return;
+
+  if (stream_->appsrc) {
+    gst_object_unref(stream_->appsrc);
+    stream_->appsrc = nullptr;
+  }
+  if (stream_->appsink) {
+    gst_object_unref(stream_->appsink);
+    stream_->appsink = nullptr;
+  }
+  if (stream_->pipeline) {
+    sima::pipeline_internal::stop_and_unref(stream_->pipeline);
+    stream_->pipeline = nullptr;
+  }
+
+  stream_.reset();
 }
 
 sima::FrameTensor ModelSession::run_tensor(const cv::Mat& input) {
@@ -117,11 +509,64 @@ sima::FrameTensor ModelSession::run_tensor(const cv::Mat& input) {
     throw std::runtime_error("ModelSession::run_tensor: not initialized");
   }
 
-  auto out = session_.run(input);
-  if (out.kind != sima::RunOutputKind::Tensor || !out.tensor.has_value()) {
-    throw std::runtime_error("ModelSession::run_tensor: expected tensor output");
+  ensure_stream(input);
+
+  cv::Mat contiguous = input;
+  if (!contiguous.isContinuous()) {
+    contiguous = input.clone();
   }
-  return *out.tensor;
+
+  GstBuffer* buf =
+      allocate_input_buffer(stream_->caps.bytes, stream_->src_opt, stream_->pool_guard);
+  if (!buf) {
+    throw std::runtime_error("ModelSession::run_tensor: failed to allocate GstBuffer");
+  }
+
+  GstMapInfo mi;
+  if (!gst_buffer_map(buf, &mi, GST_MAP_WRITE)) {
+    gst_buffer_unref(buf);
+    throw std::runtime_error("ModelSession::run_tensor: failed to map GstBuffer");
+  }
+
+  std::memcpy(mi.data, contiguous.data, stream_->caps.bytes);
+  gst_buffer_unmap(buf, &mi);
+  maybe_add_simaai_meta(buf, next_input_frame_id(), stream_->src_opt);
+
+  if (gst_app_src_push_buffer(GST_APP_SRC(stream_->appsrc), buf) != GST_FLOW_OK) {
+    gst_buffer_unref(buf);
+    throw std::runtime_error("ModelSession::run_tensor: appsrc push failed");
+  }
+
+  const int timeout_ms = std::max(
+      10,
+      std::atoi(
+          sima::pipeline_internal::env_str("SIMA_GST_RUN_INPUT_TIMEOUT_MS", "10000").c_str()));
+
+  auto sample_opt = sima::pipeline_internal::try_pull_sample_sliced(
+      stream_->pipeline,
+      stream_->appsink,
+      timeout_ms,
+      nullptr,
+      "ModelSession::run_tensor");
+
+  if (!sample_opt.has_value()) {
+    throw std::runtime_error("ModelSession::run_tensor: timeout waiting for output");
+  }
+
+  std::unique_ptr<GstSample, decltype(&gst_sample_unref)> sample(*sample_opt,
+                                                                 gst_sample_unref);
+  GstCaps* out_caps = gst_sample_get_caps(sample.get());
+  const GstStructure* st = out_caps ? gst_caps_get_structure(out_caps, 0) : nullptr;
+  const char* media = st ? gst_structure_get_name(st) : nullptr;
+  if (media && std::string(media).rfind("video/x-raw", 0) == 0) {
+    const char* fmt = gst_structure_get_string(st, "format");
+    if (fmt && std::string(fmt) == "NV12") {
+      throw std::runtime_error("ModelSession::run_tensor: expected tensor output");
+    }
+  }
+
+  sima::FrameTensorRef ref = sima::pipeline_internal::sample_to_tensor_ref(sample.get());
+  return ref.to_copy();
 }
 
 cv::Mat ModelSession::run(const cv::Mat& input) {
@@ -130,6 +575,7 @@ cv::Mat ModelSession::run(const cv::Mat& input) {
 }
 
 void ModelSession::close() {
+  teardown_stream();
   initialized_ = false;
   tensor_mode_ = false;
   guard_.reset();

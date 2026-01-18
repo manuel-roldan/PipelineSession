@@ -2,6 +2,7 @@
 
 #include "mpk/ModelMPK.h"
 #include "nodes/groups/ImageInputGroup.h"
+#include "nodes/groups/GroupOutputSpec.h"
 #include "nodes/groups/ModelGroups.h"
 #include "pipeline/PipelineSession.h"
 
@@ -57,14 +58,12 @@ int main(int argc, char** argv) {
   std::cout << "Using model: " << model_path << "\n";
   std::cout << "Using image: " << image_path << "\n";
 
-  auto model = sima::mpk::ModelMPK::load(
-      model_path,
-      sima::mpk::ModelMPKOptions{false, {}, {}, kInputWidth, kInputHeight, "NV12", 0});
-
   sima::nodes::groups::ImageInputGroupOptions opt;
   opt.path = image_path;
   opt.imagefreeze_num_buffers = 8;
   opt.fps = kInferFps;
+  opt.use_videorate = true;
+  opt.use_videoscale = true;
   opt.output_caps.enable = true;
   opt.output_caps.format = "NV12";
   opt.output_caps.width = kInputWidth;
@@ -74,6 +73,11 @@ int main(int argc, char** argv) {
   opt.sima_decoder.enable = true;
   opt.sima_decoder.decoder_name = "decoder";
   opt.sima_decoder.raw_output = true;
+
+  const sima::OutputSpec input_spec = sima::nodes::groups::ImageInputGroupOutputSpec(opt);
+  auto model = sima::mpk::ModelMPK::load(
+      model_path,
+      sima::mpk::options_from_output_spec(input_spec));
 
   try {
     sima::PipelineSession p;

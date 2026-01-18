@@ -1777,6 +1777,66 @@ TensorStream PipelineSession::run_tensor() {
   return ts;
 }
 
+TapStream PipelineSession::run_packet_stream() {
+  gst_init_once();
+
+  throw_if_input_appsrc_present(nodes_, "PipelineSession::run_packet_stream");
+
+  enforce_sink_last(nodes_);
+
+  require_element("appsink", "PipelineSession::run_packet_stream");
+  require_element("identity", "PipelineSession::run_packet_stream");
+
+  const bool insert_boundaries =
+      should_insert_boundaries_for_mode("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
+
+  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+  last_pipeline_ = br.pipeline_string;
+
+  auto guard = guard_;
+
+  GError* err = nullptr;
+  GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
+  if (!pipeline) {
+    std::string msg = err ? err->message : "unknown";
+    if (err) g_error_free(err);
+    throw std::runtime_error(
+        "PipelineSession::run_packet_stream: gst_parse_launch failed: " + msg +
+        "\nPipeline:\n" + last_pipeline_);
+  }
+  if (err) g_error_free(err);
+
+  if (env_bool("SIMA_GST_ENFORCE_NAMES", false)) {
+    enforce_names_contract(pipeline, br);
+  }
+
+  attach_boundary_probes(pipeline, br.diag);
+
+  GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
+  if (!sink) {
+    maybe_dump_dot(pipeline, "run_packet_missing_mysink");
+    stop_and_unref(pipeline);
+    throw std::runtime_error(
+        "PipelineSession::run_packet_stream: appsink 'mysink' not found.\n"
+        "Fix: add OutputAppSink() as the last node.\nPipeline:\n" +
+        last_pipeline_);
+  }
+
+  try {
+    set_state_or_throw(pipeline, GST_STATE_PLAYING, "PipelineSession::run_packet_stream", br.diag);
+  } catch (...) {
+    gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw;
+  }
+
+  TapStream ts(pipeline, sink);
+  ts.set_debug_pipeline(last_pipeline_);
+  ts.set_diag(br.diag);
+  ts.set_guard(std::move(guard));
+  return ts;
+}
+
 RunInputResult PipelineSession::run(const cv::Mat& input) {
   gst_init_once();
 

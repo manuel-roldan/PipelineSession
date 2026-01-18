@@ -71,6 +71,7 @@ public:
   // Typed runner: last node must be OutputAppSink() and negotiated into NV12.
   FrameStream run();
   TensorStream run_tensor();
+  TapStream run_packet_stream();
   RunInputResult run(const cv::Mat& input);
   RunDebugResult run_debug(const RunDebugOptions& opt, const cv::Mat& input);
   PipelineReport validate(const ValidateOptions& opt, const cv::Mat& input) const;

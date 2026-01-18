@@ -12,9 +12,9 @@ struct ImageInputGroupOptions {
   int imagefreeze_num_buffers = -1;
   int fps = 30;
 
-  bool use_videorate = true;
+  bool use_videorate = false;
   bool use_videoconvert = true;
-  bool use_videoscale = true;
+  bool use_videoscale = false;
 
   struct OutputCaps {
     bool enable = true;

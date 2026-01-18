@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sima/builder/Node.h"
+#include "sima/builder/OutputSpec.h"
 
 #include <memory>
 #include <string>
@@ -8,7 +9,7 @@
 
 namespace sima {
 
-class H264EncodeSima final : public Node {
+class H264EncodeSima final : public Node, public OutputSpecProvider {
 public:
   H264EncodeSima(int w, int h, int fps,
                  int bitrate_kbps = 400,
@@ -19,6 +20,7 @@ public:
 
   std::string gst_fragment(int node_index) const override;
   std::vector<std::string> element_names(int node_index) const override;
+  OutputSpec output_spec(const OutputSpec& input) const override;
 
   int width() const { return w_; }
   int height() const { return h_; }
