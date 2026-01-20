@@ -14,6 +14,7 @@ public:
 
   std::string kind() const override { return "FileSrc"; }
   std::string user_label() const override { return path_; }
+  InputRole input_role() const override { return InputRole::Source; }
 
   std::string gst_fragment(int node_index) const override;
   std::vector<std::string> element_names(int node_index) const override;

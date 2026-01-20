@@ -150,11 +150,52 @@ static std::string update_input_buffers_name(const std::string& file_path,
   return "input_buffers->name not found.";
 }
 
+static bool parse_mla_next_cpu_override(int& out) {
+  const char* v = std::getenv("SIMA_MLA_NEXT_CPU");
+  if (!v || !*v) return false;
+  std::string s(v);
+  std::string upper = to_upper(s);
+  if (upper == "APU") {
+    out = 0;
+    return true;
+  }
+  if (upper == "CVU" || upper == "MLA") {
+    out = 1;
+    return true;
+  }
+  char* end = nullptr;
+  long val = std::strtol(v, &end, 10);
+  if (end && *end == '\0') {
+    out = static_cast<int>(val);
+    return true;
+  }
+  return false;
+}
+
+static void update_mla_next_cpu(const std::string& file_path, int next_cpu) {
+  std::ifstream json_file(file_path);
+  if (!json_file.is_open()) return;
+
+  json json_data;
+  json_file >> json_data;
+
+  if (!json_data.contains("simaai__params") ||
+      !json_data["simaai__params"].is_object()) {
+    return;
+  }
+
+  json_data["simaai__params"]["next_cpu"] = next_cpu;
+  std::ofstream updated_json_file(file_path);
+  if (!updated_json_file.is_open()) return;
+  updated_json_file << json_data.dump(4);
+}
+
 static std::tuple<int, int, std::string> read_and_update_preproc_json(
     const std::string& etc_dir,
     int inWidth,
     int inHeight,
     const std::string& inFormat,
+    const std::string& next_cpu_override,
     bool normalize,
     const std::vector<float>& channel_mean,
     const std::vector<float>& channel_stddev) {
@@ -187,6 +228,10 @@ static std::tuple<int, int, std::string> read_and_update_preproc_json(
   } else if (json_data.contains("output_img_type")) {
     out_img_type = json_data["output_img_type"].get<std::string>();
     json_data["input_img_type"] = out_img_type;
+  }
+
+  if (!next_cpu_override.empty()) {
+    json_data["next_cpu"] = next_cpu_override;
   }
 
   if (normalize) {
@@ -483,7 +528,8 @@ static std::string upstream_name_for_stage(const std::vector<SeqEntry>& seq, Mod
 static ModelFragment build_fragment_linear(const std::string& etc_dir,
                                            const std::vector<SeqEntry>& seq,
                                            const std::string& initial_input_name,
-                                           const std::string& queue_prefix) {
+                                           const std::string& queue_prefix,
+                                           const ModelMPKOptions& opt) {
   ModelFragment frag;
   if (seq.empty()) return frag;
 
@@ -493,12 +539,21 @@ static ModelFragment build_fragment_linear(const std::string& etc_dir,
 
   const std::string qprefix = queue_prefix.empty() ? "q" : queue_prefix;
   int qnum = 0;
+  int mla_next_cpu_override = -1;
+  const bool has_mla_next_cpu = parse_mla_next_cpu_override(mla_next_cpu_override);
   auto add_queue = [&](std::ostringstream& ss) {
+    if (opt.disable_internal_queues) return;
+    const int max_buffers =
+        (opt.queue_max_buffers > 0) ? opt.queue_max_buffers : kQueueMaxSizeBuffers;
+    const int max_bytes = kQueueMaxSizeBytes;
+    const int64_t max_time =
+        (opt.queue_max_time_ns >= 0) ? opt.queue_max_time_ns : kQueueMaxSizeTime;
+    const std::string leaky = !opt.queue_leaky.empty() ? opt.queue_leaky : kQueueLeakyMode;
     ss << "! queue name=" << qprefix << (++qnum)
-       << " max-size-buffers=" << kQueueMaxSizeBuffers
-       << " max-size-bytes=" << kQueueMaxSizeBytes
-       << " max-size-time=" << kQueueMaxSizeTime
-       << " leaky=" << kQueueLeakyMode
+       << " max-size-buffers=" << max_buffers
+       << " max-size-bytes=" << max_bytes
+       << " max-size-time=" << max_time
+       << " leaky=" << leaky
        << " silent=" << (kQueueSilent ? "true" : "false") << " ";
     frag.elements.push_back(qprefix + std::to_string(qnum));
   };
@@ -509,14 +564,24 @@ static ModelFragment build_fragment_linear(const std::string& etc_dir,
     const std::string name = elem.name;
     const std::string config = (fs::path(etc_dir) / elem.config_path).string();
 
+    if (has_mla_next_cpu && plugin == "simaaiprocessmla") {
+      update_mla_next_cpu(config, mla_next_cpu_override);
+    }
     update_input_buffers_name(config, previous_node_name);
 
     if (i) pipelineStr << "! ";
     pipelineStr << plugin
                 << " name=" << name
                 << " config=" << config << " ";
-    if (plugin == "simaaiprocessmla") {
+    if (plugin == "simaaiprocesscvu") {
+      if (opt.num_buffers_cvu > 0) {
+        pipelineStr << " num-buffers=" << opt.num_buffers_cvu << " ";
+      }
+    } else if (plugin == "simaaiprocessmla") {
       pipelineStr << "multi-pipeline=true ";
+      if (opt.num_buffers_mla > 0) {
+        pipelineStr << " num-buffers=" << opt.num_buffers_mla << " ";
+      }
     }
 
     frag.elements.push_back(name);
@@ -562,6 +627,7 @@ ModelMPK ModelMPK::load(const std::string& tar_gz, const ModelMPKOptions& opt) {
                                      out.options_.input_width,
                                      out.options_.input_height,
                                      out.options_.input_format,
+                                     out.options_.preproc_next_cpu,
                                      out.options_.normalize,
                                      out.options_.normalize
                                          ? std::vector<float>{mean3[0], mean3[1], mean3[2]}
@@ -588,6 +654,14 @@ ModelMPK ModelMPK::load(const std::string& tar_gz, const ModelMPKOptions& opt) {
     out.options_.input_depth = (out.options_.input_format == "GRAY") ? 1 : 3;
   }
 
+  // Fast/throughput defaults: match known high-FPS pipelines.
+  if (out.options_.fast_mode) {
+    if (out.options_.num_buffers_cvu == 0) out.options_.num_buffers_cvu = 5;
+    if (out.options_.num_buffers_mla == 0) out.options_.num_buffers_mla = 5;
+    out.options_.disable_internal_queues = true;
+    // Leave queue_* untouched when queues are disabled; otherwise, keep user overrides.
+  }
+
   return out;
 }
 
@@ -596,11 +670,16 @@ ModelFragment ModelMPK::fragment(ModelStage stage) const {
   std::vector<SeqEntry> sel = select_stage(seq, stage);
   if (sel.empty()) return {};
 
-  std::string upstream = options_.upstream_name.empty()
-      ? upstream_name_for_stage(seq, stage)
-      : options_.upstream_name;
+  std::string upstream;
+  if (stage == ModelStage::Preprocess || stage == ModelStage::Full) {
+    upstream = options_.upstream_name.empty()
+        ? upstream_name_for_stage(seq, stage)
+        : options_.upstream_name;
+  } else {
+    upstream = upstream_name_for_stage(seq, stage);
+  }
   const std::string queue_prefix = std::string("q_") + stage_label(stage) + "_";
-  return build_fragment_linear(etc_dir_, sel, upstream, queue_prefix);
+  return build_fragment_linear(etc_dir_, sel, upstream, queue_prefix, options_);
 }
 
 std::string ModelMPK::gst_fragment(ModelStage stage) const {

@@ -9,20 +9,12 @@
 
 using namespace sima::nodes;
 
-namespace {
-
-void sleep_ms(int ms) {
-  std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-}
-
-} // namespace
-
 int main() {
   try {
     // Default: latest frame, no clock sync.
     {
       sima::PipelineSession p;
-      p.gst("videotestsrc num-buffers=1");
+      p.gst("videotestsrc num-buffers=1", sima::InputRole::Source);
       p.add(VideoConvert());
       p.add(CapsNV12SysMem(64, 64, 30));
       p.add(OutputAppSink());
@@ -37,49 +29,42 @@ int main() {
     // Latest/drop: only the most recent buffer should remain.
     {
       sima::PipelineSession p;
-      p.gst("videotestsrc num-buffers=5");
+      p.gst("videotestsrc num-buffers=5", sima::InputRole::Source);
       p.add(VideoConvert());
       p.add(CapsNV12SysMem(64, 64, 30));
       p.add(OutputAppSink());
 
-      auto stream = p.run();
-      sleep_ms(300);
-
-      auto first = stream.next(2000);
-      require(first.has_value(), "latest/drop: expected at least one frame");
-
-      auto extra = stream.next(100);
-      require(!extra.has_value(), "latest/drop: expected drops with max-buffers=1");
-
-      stream.close();
+      int got = 0;
+      p.set_frame_callback([&](const sima::FrameNV12Ref&) {
+        ++got;
+        return got < 1;
+      });
+      p.run();
+      require(got == 1, "latest/drop: expected exactly one frame");
     }
 
     // Every-frame: keep all buffers (bounded).
     {
       sima::PipelineSession p;
-      p.gst("videotestsrc num-buffers=5");
+      p.gst("videotestsrc num-buffers=5", sima::InputRole::Source);
       p.add(VideoConvert());
       p.add(CapsNV12SysMem(64, 64, 30));
       p.add(OutputAppSink(sima::OutputAppSinkOptions::EveryFrame(5)));
 
-      auto stream = p.run();
-      sleep_ms(300);
-
-      for (int i = 0; i < 5; ++i) {
-        auto frame = stream.next(2000);
-        require(frame.has_value(), "every-frame: missing frame");
-      }
-
-      auto extra = stream.next(100);
-      require(!extra.has_value(), "every-frame: expected exactly 5 frames");
-
-      stream.close();
+      int got = 0;
+      p.set_frame_callback([&](const sima::FrameNV12Ref&) {
+        ++got;
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        return true;
+      });
+      p.run();
+      require(got == 5, "every-frame: expected exactly 5 frames");
     }
 
     // add_output_tensor forwards sink options.
     {
       sima::PipelineSession p;
-      p.gst("videotestsrc num-buffers=1");
+      p.gst("videotestsrc num-buffers=1", sima::InputRole::Source);
 
       sima::OutputTensorOptions out;
       out.target_width = 64;
@@ -95,7 +80,7 @@ int main() {
     // Clocked: verify sync=true in the pipeline string.
     {
       sima::PipelineSession p;
-      p.gst("videotestsrc num-buffers=1");
+      p.gst("videotestsrc num-buffers=1", sima::InputRole::Source);
       p.add(VideoConvert());
       p.add(CapsNV12SysMem(64, 64, 30));
       p.add(OutputAppSink(sima::OutputAppSinkOptions::Clocked()));

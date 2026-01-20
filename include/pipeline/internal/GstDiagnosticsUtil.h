@@ -58,6 +58,7 @@ void maybe_dump_dot(GstElement* pipeline, const std::string& tag);
 // Diagnostics helpers
 // -----------------------------
 std::string boundary_summary(const std::shared_ptr<DiagCtx>& diag);
+std::string stage_timing_summary(const std::shared_ptr<DiagCtx>& diag);
 
 void drain_bus(GstElement* pipeline,
                const std::shared_ptr<DiagCtx>& diag,

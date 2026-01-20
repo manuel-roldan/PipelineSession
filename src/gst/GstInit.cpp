@@ -49,6 +49,14 @@ void gst_init_once() {
     char** argv = nullptr;
     gst_init(&argc, &argv);
 
+    // Ensure SiMa metadata gets registered before buffers are pushed.
+    GstPlugin* meta_plugin = gst_plugin_load_by_name("simaaimetaparser");
+    if (meta_plugin) {
+      gst_object_unref(meta_plugin);
+    }
+    static const gchar* sima_meta_tags[] = {GST_META_TAG_MEMORY_STR, nullptr};
+    gst_meta_register_custom("GstSimaMeta", sima_meta_tags, nullptr, nullptr, nullptr);
+
     if (env_bool("SIMA_GST_SUPPRESS_JSON_WARNINGS", true)) {
       g_log_set_handler("Json",
                         static_cast<GLogLevelFlags>(G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING),

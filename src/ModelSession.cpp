@@ -249,11 +249,12 @@ void maybe_add_simaai_meta(GstBuffer* buffer,
   if (!meta) return;
   GstStructure* s = gst_custom_meta_get_structure(meta);
   if (!s) return;
+  const std::string name = opt.buffer_name.empty() ? "decoder" : opt.buffer_name;
   gint64 phys_addr =
       gst_simaai_segment_memory_get_phys_addr(gst_buffer_peek_memory(buffer, 0));
   gst_structure_set(s,
                     "buffer-id", G_TYPE_INT64, phys_addr,
-                    "buffer-name", G_TYPE_STRING, "decoder",
+                    "buffer-name", G_TYPE_STRING, name.c_str(),
                     "buffer-offset", G_TYPE_INT64, static_cast<gint64>(0),
                     "frame-id", G_TYPE_INT64, static_cast<gint64>(frame_id),
                     "stream-id", G_TYPE_STRING, "0",
@@ -385,16 +386,22 @@ void ModelSession::build_session(const std::string& tar_gz,
     sess.add(sima::nodes::InputAppSrc(src_opt));
     sess.add(pack_.to_node_group(sima::mpk::ModelStage::Full));
   } else {
-    pack_ = sima::mpk::ModelMPK::load(
-        tar_gz,
-        sima::mpk::ModelMPKOptions{
-            opt.normalize,
-            opt.mean,
-            opt.stddev,
-            opt.input_width,
-            opt.input_height,
-            opt.input_format,
-            0});
+    sima::mpk::ModelMPKOptions mpk_opt;
+    mpk_opt.normalize = opt.normalize;
+    mpk_opt.mean = opt.mean;
+    mpk_opt.stddev = opt.stddev;
+    mpk_opt.fast_mode = opt.fast_mode;
+    mpk_opt.disable_internal_queues = opt.disable_internal_queues;
+    mpk_opt.input_width = opt.input_width;
+    mpk_opt.input_height = opt.input_height;
+    mpk_opt.input_format = opt.input_format;
+    mpk_opt.input_depth = 0;
+    mpk_opt.num_buffers_cvu = opt.num_buffers_cvu;
+    mpk_opt.num_buffers_mla = opt.num_buffers_mla;
+    mpk_opt.queue_max_buffers = opt.queue_max_buffers;
+    mpk_opt.queue_max_time_ns = opt.queue_max_time_ns;
+    mpk_opt.queue_leaky = opt.queue_leaky;
+    pack_ = sima::mpk::ModelMPK::load(tar_gz, mpk_opt);
     src_opt = pack_.input_appsrc_options(/*tensor_mode=*/false);
     sess.add(sima::nodes::InputAppSrc(src_opt));
     sess.add(pack_.to_node_group(sima::mpk::ModelStage::Full));

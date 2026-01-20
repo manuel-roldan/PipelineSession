@@ -26,6 +26,9 @@ struct InputAppSrcOptions {
   bool use_simaai_pool = true;
   int pool_min_buffers = 5;
   int pool_max_buffers = 5;
+
+  // Buffer name for GstSimaMeta (should match upstream element name).
+  std::string buffer_name = "decoder";
 };
 
 class InputAppSrc final : public Node, public OutputSpecProvider {
@@ -34,6 +37,7 @@ public:
 
   std::string kind() const override { return "InputAppSrc"; }
   std::string user_label() const override { return "mysrc"; }
+  InputRole input_role() const override { return InputRole::Push; }
 
   std::string gst_fragment(int node_index) const override;
   std::vector<std::string> element_names(int node_index) const override;

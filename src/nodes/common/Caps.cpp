@@ -29,12 +29,14 @@ std::string sanitize_name(const std::string& in) {
 
 class GstNode final : public sima::Node {
 public:
-  explicit GstNode(std::string fragment) : fragment_(std::move(fragment)) {
+  explicit GstNode(std::string fragment, sima::InputRole role)
+      : fragment_(std::move(fragment)), role_(role) {
     if (fragment_.empty()) fragment_ = "identity silent=true";
   }
 
   std::string kind() const override { return "GstNode"; }
   std::string user_label() const override { return fragment_; }
+  sima::InputRole input_role() const override { return role_; }
 
   std::string gst_fragment(int node_index) const override {
     const std::string frag = trim_(fragment_);
@@ -102,6 +104,7 @@ private:
   }
 
   std::string fragment_;
+  sima::InputRole role_ = sima::InputRole::None;
 };
 
 class CapsRawNode final : public sima::Node, public sima::OutputSpecProvider {
@@ -173,8 +176,8 @@ private:
 
 namespace sima::nodes {
 
-std::shared_ptr<sima::Node> Gst(std::string fragment) {
-  return std::make_shared<GstNode>(std::move(fragment));
+std::shared_ptr<sima::Node> Gst(std::string fragment, sima::InputRole role) {
+  return std::make_shared<GstNode>(std::move(fragment), role);
 }
 
 std::shared_ptr<sima::Node> CapsRaw(std::string format,

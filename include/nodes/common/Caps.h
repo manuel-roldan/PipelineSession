@@ -9,7 +9,8 @@
 namespace sima::nodes {
 
 // Escape hatch (implemented via a raw gst fragment node)
-std::shared_ptr<sima::Node> Gst(std::string fragment);
+std::shared_ptr<sima::Node> Gst(std::string fragment,
+                                sima::InputRole role = sima::InputRole::None);
 
 // Caps helpers (typed; always produce a capsfilter)
 std::shared_ptr<sima::Node> CapsRaw(std::string format,

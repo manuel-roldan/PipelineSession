@@ -28,6 +28,22 @@ struct RunDebugOptions {
   int timeout_ms = 10000;
 };
 
+struct RunInputOptions {
+  bool copy_output = true;
+  bool reuse_input_buffer = false;
+  bool strict = true;
+};
+
+enum class PipelineOutputKind {
+  Frame,
+  Tensor,
+};
+
+struct PipelineSessionOptions {
+  PipelineOutputKind output_kind = PipelineOutputKind::Frame;
+  int callback_timeout_ms = 1000;
+};
+
 struct OutputTensorOptions {
   std::string format = "RGB";
   TensorLayout layout = TensorLayout::HWC;
@@ -59,8 +75,10 @@ enum class RunOutputKind {
 
 struct RunInputResult {
   RunOutputKind kind = RunOutputKind::Unknown;
+  bool owned = true;
 
   std::optional<FrameTensor> tensor;
+  std::optional<FrameTensorRef> tensor_ref;
   std::optional<FrameNV12> frame_nv12;
 
   std::string caps_string;

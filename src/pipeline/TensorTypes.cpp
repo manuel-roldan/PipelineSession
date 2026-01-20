@@ -95,7 +95,10 @@ FrameTensor FrameTensorRef::to_copy() const {
   const size_t elem = bytes_per_element(dtype);
   out.planes.reserve(planes.size());
   for (const auto& p : planes) {
-    const int row_bytes = p.width * static_cast<int>(elem);
+    int row_bytes = p.width * static_cast<int>(elem);
+    if (layout == TensorLayout::HWC && shape.size() >= 3) {
+      row_bytes = static_cast<int>(shape[1] * shape[2] * static_cast<int64_t>(elem));
+    }
     std::vector<uint8_t> buf;
     buf.resize(static_cast<size_t>(row_bytes) * static_cast<size_t>(p.height));
     for (int r = 0; r < p.height; ++r) {

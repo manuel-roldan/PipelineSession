@@ -272,6 +272,41 @@ std::string boundary_summary(const std::shared_ptr<DiagCtx>& diag) {
   return ss.str();
 }
 
+std::string stage_timing_summary(const std::shared_ptr<DiagCtx>& diag) {
+  if (!diag || diag->stage_timings.empty()) return "";
+
+  std::vector<StageTimingStats> snaps;
+  snaps.reserve(diag->stage_timings.size());
+  for (const auto& s : diag->stage_timings) {
+    if (!s) continue;
+    snaps.push_back(s->snapshot());
+  }
+  if (snaps.empty()) return "";
+
+  std::sort(snaps.begin(), snaps.end(),
+            [](const StageTimingStats& a, const StageTimingStats& b) {
+              const double avg_a =
+                  (a.samples == 0) ? 0.0 : (double)a.total_us / (double)a.samples;
+              const double avg_b =
+                  (b.samples == 0) ? 0.0 : (double)b.total_us / (double)b.samples;
+              return avg_a > avg_b;
+            });
+
+  std::ostringstream ss;
+  ss << "StageTiming:\n";
+  for (const auto& s : snaps) {
+    const double avg_ms =
+        (s.samples == 0) ? 0.0 : (double)s.total_us / (double)s.samples / 1000.0;
+    const double max_ms = (double)s.max_us / 1000.0;
+    ss << "  - " << s.stage_name
+       << " samples=" << s.samples
+       << " avg_ms=" << avg_ms
+       << " max_ms=" << max_ms
+       << "\n";
+  }
+  return ss.str();
+}
+
 void drain_bus(GstElement* pipeline,
                const std::shared_ptr<DiagCtx>& diag,
                const char* /*where*/) {

@@ -7,6 +7,12 @@
 
 namespace sima {
 
+enum class InputRole {
+  None,
+  Push,
+  Source,
+};
+
 // =============================
 // Builder Node API
 // =============================
@@ -28,6 +34,9 @@ public:
 
   // Optional memory contract for this node (runner may still override).
   virtual MemoryContract memory_contract() const { return MemoryContract::AllowEitherButReport; }
+
+  // Input role metadata used to validate run() vs run(input) usage.
+  virtual InputRole input_role() const { return InputRole::None; }
 };
 
 } // namespace sima

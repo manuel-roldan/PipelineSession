@@ -16,6 +16,15 @@ bool get_arg(int argc, char** argv, const std::string& key, std::string& out);
 std::filesystem::path default_goldfish_path();
 bool download_file(const std::string& url, const std::filesystem::path& out_path);
 std::string resolve_resnet50_tar();
+std::string resolve_yolov8s_tar(const std::filesystem::path& root = {});
+std::filesystem::path ensure_coco_sample(const std::filesystem::path& root = {});
+std::string find_boxdecode_config(const std::filesystem::path& etc_dir);
+std::string prepare_yolo_boxdecode_config(const std::string& src_path,
+                                          const std::filesystem::path& root,
+                                          int img_w,
+                                          int img_h,
+                                          float conf = 0.5f,
+                                          float nms = 0.5f);
 
 cv::Mat load_rgb_resized(const std::string& image_path, int w, int h);
 

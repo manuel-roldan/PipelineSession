@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 using namespace sima::nodes;
 
@@ -24,6 +26,36 @@ static cv::Mat nv12_to_bgr(const sima::FrameNV12& f) {
   cv::Mat bgr;
   cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_NV12);
   return bgr;
+}
+
+static sima::FrameNV12 copy_nv12_ref(const sima::FrameNV12Ref& ref) {
+  sima::FrameNV12 out;
+  out.width = ref.width;
+  out.height = ref.height;
+  out.pts_ns = ref.pts_ns;
+  out.dts_ns = ref.dts_ns;
+  out.duration_ns = ref.duration_ns;
+  out.keyframe = ref.keyframe;
+
+  const size_t y_bytes = static_cast<size_t>(ref.width) * ref.height;
+  const size_t uv_bytes = static_cast<size_t>(ref.width) * ref.height / 2;
+  out.nv12.resize(y_bytes + uv_bytes);
+
+  uint8_t* dst = out.nv12.data();
+  for (int y = 0; y < ref.height; ++y) {
+    std::memcpy(dst + static_cast<size_t>(y) * ref.width,
+                ref.y + static_cast<size_t>(y) * ref.y_stride,
+                ref.width);
+  }
+  uint8_t* dst_uv = dst + y_bytes;
+  const int uv_h = ref.height / 2;
+  for (int y = 0; y < uv_h; ++y) {
+    std::memcpy(dst_uv + static_cast<size_t>(y) * ref.width,
+                ref.uv + static_cast<size_t>(y) * ref.uv_stride,
+                ref.width);
+  }
+
+  return out;
 }
 
 static void dump_nv12_raw(const sima::FrameNV12& f, const std::string& path_nv12) {
@@ -127,27 +159,22 @@ static int run_image_once(const std::string& image_path,
   p.add(Queue());
   p.add(OutputAppSink());
 
-  auto s = p.run();
-
-  sima::FrameNV12 f{};
   bool got = false;
-
-  // Bounded retries so CI doesn’t hang; total ~6s worst case.
-  for (int i = 0; i < 15; ++i) {
-    auto opt = s.next_copy(400);  // 0.4s each
-    if (!opt) continue;
-    f = std::move(*opt);
+  sima::FrameNV12Ref ref{};
+  p.set_frame_callback([&](const sima::FrameNV12Ref& f) {
+    ref = f;
     got = true;
-    break; // first frame is fine for this test
-  }
-
-  s.close();
+    return false; // first frame is fine for this test
+  });
+  p.run();
 
   if (!got) {
     std::cerr << "[ERR] No frame received from image pipeline.\n";
     std::cerr << "[DBG] Pipeline: " << p.last_pipeline() << "\n";
     return 1;
   }
+
+  sima::FrameNV12 f = copy_nv12_ref(ref);
 
   // Decode output -> BGR
   cv::Mat dec_bgr = nv12_to_bgr(f);
@@ -193,22 +220,20 @@ static int run_video_frames(const std::string& video_path, int nframes) {
   p.add(Queue());
   p.add(OutputAppSink());
 
-  auto s = p.run();
-
   int got = 0;
-  for (int i = 0; i < nframes; ++i) {
-    auto opt = s.next_copy(2000);
-    if (!opt) break;
-    auto f = std::move(*opt);
-
-    cv::Mat bgr = nv12_to_bgr(f);
+  std::vector<sima::FrameNV12> frames;
+  p.set_frame_callback([&](const sima::FrameNV12Ref& f) {
+    frames.push_back(copy_nv12_ref(f));
+    ++got;
+    return got < nframes;
+  });
+  p.run();
+  for (int i = 0; i < static_cast<int>(frames.size()); ++i) {
+    cv::Mat bgr = nv12_to_bgr(frames[i]);
     char path[256];
     std::snprintf(path, sizeof(path), "frame_%03d.jpg", i);
     save_bgr(bgr, path);
-    got++;
   }
-
-  s.close();
   std::cerr << "[DONE] Saved " << got << " frames.\n";
   return (got > 0) ? 0 : 2;
 }

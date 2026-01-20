@@ -32,6 +32,7 @@ add_library(pipelinesession STATIC
   src/pipeline/PipelineReport.cpp
   src/pipeline/TapStream.cpp
   src/pipeline/FrameStream.cpp
+  src/pipeline/AsyncStream.cpp
   src/pipeline/TensorTypes.cpp
   src/pipeline/TensorStream.cpp
   src/pipeline/TensorUtil.cpp
@@ -67,6 +68,7 @@ add_library(pipelinesession STATIC
   src/nodes/sima/RtpH264Pay.cpp
   src/nodes/sima/SimaBoxDecode.cpp
   src/nodes/sima/SimaArgMax.cpp
+  src/nodes/sima/Preproc.cpp
   src/nodes/sima/SimaRender.cpp
   src/nodes/groups/ImageInputGroup.cpp
   src/nodes/groups/GroupOutputSpec.cpp
@@ -174,8 +176,31 @@ target_link_libraries(unit_debug_overloads_test PRIVATE pipelinesession)
 add_executable(unit_tensorstream_test tests/unit_tensorstream_test.cpp)
 target_link_libraries(unit_tensorstream_test PRIVATE pipelinesession)
 
+add_executable(async_stream_test tests/async_stream_test.cpp)
+target_link_libraries(async_stream_test PRIVATE pipelinesession)
+
 add_executable(output_appsink_policy_test tests/output_appsink_policy_test.cpp)
 target_link_libraries(output_appsink_policy_test PRIVATE pipelinesession)
+
+add_executable(yolov8s_boxdecode_test
+  tests/yolov8s_boxdecode_test.cpp
+  examples/example_utils.cpp
+)
+target_link_libraries(yolov8s_boxdecode_test PRIVATE pipelinesession)
+target_include_directories(yolov8s_boxdecode_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
+
+add_executable(yolov8s_boxdecode_bench tests/yolov8s_boxdecode_bench.cpp)
+target_link_libraries(yolov8s_boxdecode_bench PRIVATE pipelinesession)
+
+add_executable(incremental_yolov8_test
+  tests/incremental_yolov8_test.cpp
+  examples/example_utils.cpp
+)
+target_link_libraries(incremental_yolov8_test PRIVATE pipelinesession)
+target_include_directories(incremental_yolov8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
+
+add_executable(preproc_standalone_test tests/preproc_standalone_test.cpp)
+target_link_libraries(preproc_standalone_test PRIVATE pipelinesession)
 
 add_executable(modelsession_resnet50_guard_test tests/modelsession_resnet50_guard_test.cpp)
 target_link_libraries(modelsession_resnet50_guard_test PRIVATE pipelinesession)
@@ -259,6 +284,14 @@ add_test(NAME unit_tensorstream_test
 
 add_test(NAME output_appsink_policy_test
   COMMAND output_appsink_policy_test
+)
+
+add_test(NAME yolov8s_boxdecode_test
+  COMMAND yolov8s_boxdecode_test ${CMAKE_SOURCE_DIR}
+)
+
+add_test(NAME yolov8s_boxdecode_bench
+  COMMAND yolov8s_boxdecode_bench ${CMAKE_SOURCE_DIR}
 )
 
 add_test(NAME modelsession_resnet50_guard_test

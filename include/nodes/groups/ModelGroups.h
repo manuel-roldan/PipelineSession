@@ -5,6 +5,7 @@
 
 #include <string>
 #include <vector>
+#include <cstdint>
 
 namespace sima::nodes::groups {
 
@@ -16,6 +17,14 @@ struct InferOptions {
   std::vector<float> mean;
   std::vector<float> stddev;
   std::string upstream_name;
+  std::string preproc_next_cpu;
+  bool fast_mode = false;
+  bool disable_internal_queues = false;
+  int num_buffers_cvu = 0;
+  int num_buffers_mla = 0;
+  int queue_max_buffers = 0;
+  int64_t queue_max_time_ns = -1;
+  std::string queue_leaky;
 };
 
 sima::NodeGroup preprocessing(const std::string& tar_gz, const InferOptions& opt = {});

@@ -12,7 +12,8 @@ using namespace sima::nodes;
 int main() {
   try {
     sima::PipelineSession p;
-    p.gst("videotestsrc num-buffers=1 ! videoconvert ! video/x-raw,format=RGB");
+    p.gst("videotestsrc num-buffers=1 ! videoconvert ! video/x-raw,format=RGB",
+          sima::InputRole::Source);
     p.add(DebugPoint("a"));
     p.gst("boguselement");
     p.add(DebugPoint("b"));

@@ -28,11 +28,13 @@ int main(int argc, char** argv) {
     p.add(sima::nodes::groups::ImageInputGroup(opt));
     p.add(sima::nodes::OutputAppSink());
 
-    auto stream = p.run();
-    auto frame = stream.next_copy(2000);
-    require(frame.has_value(), "no frame from image group runtime test");
-
-    stream.close();
+    bool got = false;
+    p.set_frame_callback([&](const sima::FrameNV12Ref&) {
+      got = true;
+      return false;
+    });
+    p.run();
+    require(got, "no frame from image group runtime test");
     std::cout << "[OK] unit_image_group_runtime_test passed\n";
     return 0;
   } catch (const std::exception& e) {

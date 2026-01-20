@@ -8,6 +8,7 @@
 #include <csignal>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -36,6 +37,36 @@ static cv::Mat nv12_to_bgr(const sima::FrameNV12& f) {
   cv::Mat bgr;
   cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_NV12);
   return bgr;
+}
+
+static sima::FrameNV12 copy_nv12_ref(const sima::FrameNV12Ref& ref) {
+  sima::FrameNV12 out;
+  out.width = ref.width;
+  out.height = ref.height;
+  out.pts_ns = ref.pts_ns;
+  out.dts_ns = ref.dts_ns;
+  out.duration_ns = ref.duration_ns;
+  out.keyframe = ref.keyframe;
+
+  const size_t y_bytes = static_cast<size_t>(ref.width) * ref.height;
+  const size_t uv_bytes = static_cast<size_t>(ref.width) * ref.height / 2;
+  out.nv12.resize(y_bytes + uv_bytes);
+
+  uint8_t* dst = out.nv12.data();
+  for (int y = 0; y < ref.height; ++y) {
+    std::memcpy(dst + static_cast<size_t>(y) * ref.width,
+                ref.y + static_cast<size_t>(y) * ref.y_stride,
+                ref.width);
+  }
+  uint8_t* dst_uv = dst + y_bytes;
+  const int uv_h = ref.height / 2;
+  for (int y = 0; y < uv_h; ++y) {
+    std::memcpy(dst_uv + static_cast<size_t>(y) * ref.width,
+                ref.uv + static_cast<size_t>(y) * ref.uv_stride,
+                ref.width);
+  }
+
+  return out;
 }
 
 static void save_bgr(const cv::Mat& bgr, const std::string& path) {
@@ -108,43 +139,41 @@ struct DecodedResult {
 };
 
 static DecodedResult run_decode_sima_rtsp(const std::string& url) {
-  sima::PipelineSession p;
+  sima::PipelineSessionOptions opt;
+  opt.callback_timeout_ms = 12000;
+  sima::PipelineSession p(opt);
 
   p.add(RTSPInput(url, /*latency_ms=*/200, /*tcp=*/true));
   p.add(H264DepayParse());
   p.add(H264Decode(/*sima_allocator_type=*/2, /*out_format=*/"NV12"));
   p.add(OutputAppSink());
 
-
-  sima::FrameStream stream = p.run();
-
   std::this_thread::sleep_for(std::chrono::milliseconds(600));
 
   // Wait for keyframe (best-effort)
-  sima::FrameNV12 f{};
+  sima::FrameNV12Ref f{};
   bool got_any = false;
+  bool saw_keyframe = false;
+  int after_key = 0;
 
-  for (int i = 0; i < 120; ++i) {
-    auto opt = stream.next_copy(/*timeout_ms=*/12000);
-    if (!opt) continue;
-    f = std::move(*opt);
+  p.set_frame_callback([&](const sima::FrameNV12Ref& frame) {
+    f = frame;
     got_any = true;
-    if (f.keyframe) break;
-  }
+    if (frame.keyframe && !saw_keyframe) {
+      saw_keyframe = true;
+      after_key = 0;
+    }
+    if (!saw_keyframe) return true;
+    if (after_key >= 8) return false;
+    ++after_key;
+    return true;
+  });
+  p.run();
 
   if (!got_any) {
-    stream.close();
     return {false, {}};
   }
-
-  // Grab a few frames after keyframe to settle
-  for (int i = 0; i < 8; ++i) {
-    auto opt = stream.next_copy(/*timeout_ms=*/12000);
-    if (opt) f = std::move(*opt);
-  }
-
-  stream.close();
-  return {true, std::move(f)};
+  return {true, copy_nv12_ref(f)};
 }
 
 int main(int argc, char** argv) {

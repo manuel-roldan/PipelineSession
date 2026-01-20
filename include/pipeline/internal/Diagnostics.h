@@ -38,6 +38,29 @@ struct BoundaryFlowCounters {
   }
 };
 
+struct StageTimingStats {
+  std::string stage_name;
+  uint64_t samples = 0;
+  uint64_t total_us = 0;
+  uint64_t max_us = 0;
+};
+
+struct StageTimingCounters {
+  std::string stage_name;
+  std::atomic<uint64_t> samples{0};
+  std::atomic<uint64_t> total_us{0};
+  std::atomic<uint64_t> max_us{0};
+
+  StageTimingStats snapshot() const {
+    StageTimingStats s;
+    s.stage_name = stage_name;
+    s.samples = samples.load(std::memory_order_relaxed);
+    s.total_us = total_us.load(std::memory_order_relaxed);
+    s.max_us = max_us.load(std::memory_order_relaxed);
+    return s;
+  }
+};
+
 struct DiagCtx {
   std::string pipeline_string;
   std::vector<NodeReport> node_reports;
@@ -46,6 +69,7 @@ struct DiagCtx {
   std::vector<BusMessage> bus;
 
   std::vector<std::unique_ptr<BoundaryFlowCounters>> boundaries;
+  std::vector<std::unique_ptr<StageTimingCounters>> stage_timings;
 
   static int64_t now_us() { return (int64_t)g_get_monotonic_time(); }
 

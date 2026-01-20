@@ -19,6 +19,14 @@ sima::mpk::ModelMPKOptions to_pack_options(const InferOptions& opt) {
   out.input_height = opt.input_height;
   out.input_format = opt.input_format;
   out.upstream_name = opt.upstream_name;
+  out.fast_mode = opt.fast_mode;
+  out.preproc_next_cpu = opt.preproc_next_cpu;
+  out.disable_internal_queues = opt.disable_internal_queues;
+  out.num_buffers_cvu = opt.num_buffers_cvu;
+  out.num_buffers_mla = opt.num_buffers_mla;
+  out.queue_max_buffers = opt.queue_max_buffers;
+  out.queue_max_time_ns = opt.queue_max_time_ns;
+  out.queue_leaky = opt.queue_leaky;
   return out;
 }
 

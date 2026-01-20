@@ -419,11 +419,12 @@ void maybe_add_simaai_meta(GstBuffer* buffer,
   if (!meta) return;
   GstStructure* s = gst_custom_meta_get_structure(meta);
   if (!s) return;
+  const std::string name = opt.buffer_name.empty() ? "decoder" : opt.buffer_name;
   gint64 phys_addr =
       gst_simaai_segment_memory_get_phys_addr(gst_buffer_peek_memory(buffer, 0));
   gst_structure_set(s,
                     "buffer-id", G_TYPE_INT64, phys_addr,
-                    "buffer-name", G_TYPE_STRING, "decoder",
+                    "buffer-name", G_TYPE_STRING, name.c_str(),
                     "buffer-offset", G_TYPE_INT64, static_cast<gint64>(0),
                     "frame-id", G_TYPE_INT64, static_cast<gint64>(0),
                     "stream-id", G_TYPE_STRING, "0",
