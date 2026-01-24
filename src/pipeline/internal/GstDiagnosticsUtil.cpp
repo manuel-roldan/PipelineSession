@@ -1,5 +1,6 @@
 // src/pipeline/internal/GstDiagnosticsUtil.cpp
 #include "pipeline/internal/GstDiagnosticsUtil.h"
+#include "pipeline/internal/DispatcherRecovery.h"
 
 #include "sima/pipeline/Errors.h"
 
@@ -354,6 +355,9 @@ void throw_if_bus_error(GstElement* pipeline,
       maybe_dump_dot(pipeline, std::string(where) + "_error");
 
       PipelineReport rep = diag ? diag->snapshot_basic() : PipelineReport{};
+      if (match_dispatcher_unavailable(line)) {
+        rep.error_code = kDispatcherUnavailableError;
+      }
       rep.repro_note = std::string(where) + ": GST ERROR: " + line;
       if (diag) rep.repro_note += "\n" + boundary_summary(diag);
       throw PipelineError(rep.repro_note, std::move(rep));

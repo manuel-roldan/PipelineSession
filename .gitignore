@@ -32,3 +32,9 @@ CTestTestfile.cmake
 *.mkv
 *.avi
 tmp/
+async_tput.csv
+decoded_sima.nv12
+decoded_sima_crop.jpg
+decoded_sima_full.jpg
+reference_content.jpg
+rtsp_decoder_direct.nv12

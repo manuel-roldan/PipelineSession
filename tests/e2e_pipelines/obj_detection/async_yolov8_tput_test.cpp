@@ -1,0 +1,360 @@
+#include "pipeline/PipelineSession.h"
+#include "nodes/common/AppSink.h"
+#include "nodes/groups/ModelGroups.h"
+#include "nodes/io/InputAppSrc.h"
+#include "nodes/sima/SimaBoxDecode.h"
+#include "mpk/ModelMPK.h"
+#if defined(SIMA_WITH_OPENCV)
+#include "mpk/ModelMPKOpenCV.h"
+#endif
+
+#include "e2e_pipelines/e2e_utils.h"
+#include "e2e_pipelines/obj_detection/obj_detection_utils.h"
+#include "test_utils.h"
+
+#include <opencv2/imgcodecs.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+struct AsyncTestConfig {
+  int iters = 200;
+  int warm = 100;
+  double min_fps = 330.0;
+  float min_score = 0.52f;
+  float min_iou = 0.30f;
+};
+
+struct RunSummary {
+  bool ok = false;
+  int outputs = 0;
+  double avg_fps = 0.0;
+  std::string note;
+};
+
+void step_log(const char* label) {
+  std::cout << "[STEP] " << label << std::endl;
+}
+
+void append_note(std::string& note, const std::string& part) {
+  if (part.empty()) return;
+  if (!note.empty()) note += ";";
+  note += part;
+}
+
+std::string sanitize_note(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    out.push_back((c == '\n' || c == '\r') ? '|' : c);
+  }
+  return out;
+}
+
+bool pull_with_timeout(sima::PipelineRun& async,
+                       int pull_timeout_ms,
+                       int max_timeouts,
+                       int& timeout_count,
+                       std::optional<sima::RunInputResult>& out,
+                       std::string& err) {
+  while (true) {
+    try {
+      out = async.pull(pull_timeout_ms);
+      timeout_count = 0;
+      return true;
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      if (pull_timeout_ms >= 0 &&
+          msg.find("timeout waiting for output") != std::string::npos) {
+        timeout_count += 1;
+        if (max_timeouts > 0 && timeout_count >= max_timeouts) {
+          err = msg;
+          return false;
+        }
+        continue;
+      }
+      err = msg;
+      return false;
+    }
+  }
+}
+
+bool extract_bbox_payload(const sima::RunInputResult& result,
+                          int iter,
+                          std::vector<uint8_t>& payload,
+                          std::string& err) {
+  if (result.kind != sima::RunOutputKind::Tensor) {
+    err = "capture_expected_tensor iter=" + std::to_string(iter);
+    return false;
+  }
+  if (result.neat.has_value()) {
+    const auto& tensor = result.neat.value();
+    std::string fmt = result.format;
+    if (fmt.empty() && tensor.semantic.tess.has_value()) {
+      fmt = tensor.semantic.tess->format;
+    }
+    if (!fmt.empty() && fmt != "BBOX") {
+      err = "capture_expected_bbox iter=" + std::to_string(iter) +
+            " format=" + fmt;
+      return false;
+    }
+    sima::NeatMapping mapping = tensor.map(sima::NeatMapMode::Read);
+    if (!mapping.data) {
+      err = "capture_missing_mapping iter=" + std::to_string(iter);
+      return false;
+    }
+    size_t bytes = 0;
+    if (!tensor.shape.empty()) {
+      size_t elem = 1;
+      switch (tensor.dtype) {
+        case sima::TensorDType::UInt8: elem = 1; break;
+        case sima::TensorDType::Int8: elem = 1; break;
+        case sima::TensorDType::UInt16: elem = 2; break;
+        case sima::TensorDType::Int16: elem = 2; break;
+        case sima::TensorDType::Int32: elem = 4; break;
+        case sima::TensorDType::BFloat16: elem = 2; break;
+        case sima::TensorDType::Float32: elem = 4; break;
+        case sima::TensorDType::Float64: elem = 8; break;
+      }
+      bytes = elem;
+      for (auto dim : tensor.shape) {
+        if (dim <= 0) {
+          bytes = 0;
+          break;
+        }
+        bytes *= static_cast<size_t>(dim);
+      }
+    }
+    if (bytes == 0) bytes = mapping.size_bytes;
+    if (bytes > mapping.size_bytes) {
+      err = "capture_size_mismatch iter=" + std::to_string(iter);
+      return false;
+    }
+    payload.assign(static_cast<const uint8_t*>(mapping.data),
+                   static_cast<const uint8_t*>(mapping.data) + bytes);
+  } else {
+    err = "capture_missing_tensor iter=" + std::to_string(iter);
+    return false;
+  }
+  if (payload.empty()) {
+    err = "capture_empty_payload iter=" + std::to_string(iter);
+    return false;
+  }
+  return true;
+}
+
+RunSummary run_yolov8_async_tput(const fs::path& root,
+                                 const cv::Mat& img,
+                                 const AsyncTestConfig& cfg) {
+  RunSummary res;
+
+  const std::string tar_gz = sima_e2e::resolve_yolov8s_tar(root);
+  require(!tar_gz.empty(), "Failed to locate yolo_v8s MPK tarball");
+
+#if defined(SIMA_WITH_OPENCV)
+  auto model = sima::mpk::ModelMPK(tar_gz, img);
+#else
+  auto model = sima::mpk::ModelMPK(
+      tar_gz,
+      "video/x-raw",
+      "BGR",
+      img.cols,
+      img.rows,
+      3);
+#endif
+  const int topk = 100;
+
+  sima::PipelineSession p;
+
+  p.add(sima::nodes::InputAppSrc());
+  p.add(sima::nodes::groups::Preprocess(model));
+  p.add(sima::nodes::groups::MLA(model));
+  p.add(sima::nodes::SimaBoxDecode(
+      model,
+      "yolov8",
+      img.cols,
+      img.rows,
+      cfg.min_score,
+      0.5f,
+      topk));
+
+  p.add(sima::nodes::OutputAppSink());
+
+  const std::vector<objdet::ExpectedBox> expected = objdet::expected_people_boxes();
+
+  step_log("async: before build");
+  auto async = p.build(img);
+  step_log("async: after build");
+
+  const int warm_timeout_ms = 60000;
+  const int pull_timeout_ms = 1000;
+  const int max_timeouts = 3;
+
+  try {
+    step_log("async: before warmup");
+    async.warmup(img, cfg.warm, warm_timeout_ms);
+    step_log("async: after warmup");
+  } catch (const std::exception& e) {
+    res.ok = false;
+    append_note(res.note, "warmup_error=" + sanitize_note(e.what()));
+    return res;
+  }
+
+  std::mutex error_mu;
+  std::chrono::steady_clock::time_point start;
+  std::chrono::steady_clock::time_point end;
+
+  std::atomic<int> measured_out{0};
+  std::string consumer_error;
+  std::atomic<bool> stop_requested{false};
+  std::vector<std::vector<uint8_t>> verify_payloads;
+  verify_payloads.reserve(static_cast<size_t>(cfg.iters));
+
+  auto set_error = [&](const std::string& msg) {
+    {
+      std::lock_guard<std::mutex> lock(error_mu);
+      if (consumer_error.empty()) {
+        consumer_error = msg;
+      }
+      stop_requested.store(true);
+    }
+  };
+
+  std::thread consumer([&]() {
+    int timeout_count = 0;
+    try {
+      while (true) {
+        std::optional<sima::RunInputResult> out;
+        std::string err;
+        if (!pull_with_timeout(async,
+                               pull_timeout_ms,
+                               max_timeouts,
+                               timeout_count,
+                               out,
+                               err)) {
+          if (!err.empty()) {
+            set_error(err);
+          }
+          break;
+        }
+        if (!out.has_value()) break;
+        const int m = measured_out.fetch_add(1) + 1;
+        std::vector<uint8_t> payload;
+        if (!extract_bbox_payload(*out, m - 1, payload, err)) {
+          set_error(err);
+          break;
+        }
+        verify_payloads.push_back(std::move(payload));
+        if (m == cfg.iters) break;
+      }
+    } catch (const std::exception& e) {
+      set_error(e.what());
+    }
+  });
+
+  start = std::chrono::steady_clock::now();
+  for (int i = 0; i < cfg.iters; ++i) {
+    if (stop_requested.load()) break;
+    (void)async.push(img);
+  }
+
+  async.close_input();
+  consumer.join();
+  end = std::chrono::steady_clock::now();
+
+  const double elapsed_s =
+      std::chrono::duration<double>(end - start).count();
+
+  res.outputs = measured_out.load();
+  res.avg_fps = (elapsed_s > 0.0)
+      ? (static_cast<double>(res.outputs) / elapsed_s)
+      : 0.0;
+  res.ok = (res.outputs == cfg.iters);
+
+  if (!consumer_error.empty()) {
+    append_note(res.note, "async_pull_error=" + sanitize_note(consumer_error));
+    res.ok = false;
+  }
+  if (elapsed_s <= 0.0) {
+    append_note(res.note, "async_timing_incomplete");
+    res.ok = false;
+  }
+
+  const size_t payloads = verify_payloads.size();
+  if (payloads != static_cast<size_t>(cfg.iters)) {
+    append_note(res.note, "verify_payloads=" + std::to_string(payloads));
+    res.ok = false;
+  }
+  const size_t verify_count = std::min(payloads, static_cast<size_t>(cfg.iters));
+  for (size_t i = 0; i < verify_count; ++i) {
+    const auto boxes = objdet::parse_boxes_strict(
+        verify_payloads[i], img.cols, img.rows, topk, false);
+    const objdet::MatchResult match = objdet::match_expected_boxes(
+        boxes, expected, cfg.min_score, cfg.min_iou);
+    if (!match.ok) {
+      append_note(res.note,
+                  "verify_mismatch iter=" + std::to_string(i) + " " + match.note);
+      res.ok = false;
+      break;
+    }
+  }
+
+  if (!res.ok) {
+    const std::string last_err = async.last_error();
+    if (!last_err.empty()) {
+      append_note(res.note, "async_last_error=" + sanitize_note(last_err));
+    }
+  }
+
+  return res;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+  try {
+    const fs::path root = (argc > 1) ? fs::path(argv[1]) : fs::current_path();
+    std::error_code ec;
+    fs::create_directories(root / "tmp", ec);
+    fs::current_path(root, ec);
+
+    const fs::path img_path =
+        "/home/sima/stable_pipeline_session/PipelineSession/tmp/yolov8s_people.jpg";
+    cv::Mat img_bgr = cv::imread(img_path.string(), cv::IMREAD_COLOR);
+    require(!img_bgr.empty(), "Failed to read image: " + img_path.string());
+
+    AsyncTestConfig cfg;
+
+    RunSummary res = run_yolov8_async_tput(root, img_bgr, cfg);
+    if (res.avg_fps <= cfg.min_fps) {
+      append_note(res.note, "avg_fps=" + std::to_string(res.avg_fps));
+      append_note(res.note, "min_fps=" + std::to_string(cfg.min_fps));
+      res.ok = false;
+    }
+
+    std::cout << "ASYNC_TPUT outputs=" << res.outputs
+              << " avg_fps=" << res.avg_fps
+              << " ok=" << (res.ok ? "1" : "0")
+              << " note=" << res.note << "\n";
+
+    return res.ok ? 0 : 2;
+  } catch (const std::exception& e) {
+    std::cerr << "[ERR] " << e.what() << "\n";
+    return 1;
+  }
+}

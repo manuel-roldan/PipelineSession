@@ -21,8 +21,16 @@ const char* stream_type_string(int stream_type) {
 }
 
 std::string build_caps_string(const InputAppSrcOptions& opt) {
+  if (!opt.caps_override.empty()) {
+    return opt.caps_override;
+  }
+  const bool has_fields =
+      !opt.format.empty() || opt.width > 0 || opt.height > 0 || opt.depth > 0;
+  if (!has_fields) return "";
+
   std::ostringstream caps;
-  caps << opt.media_type;
+  const std::string media = opt.media_type.empty() ? "video/x-raw" : opt.media_type;
+  caps << media;
 
   if (!opt.format.empty()) {
     caps << ",format=" << opt.format;

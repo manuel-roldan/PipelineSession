@@ -6,8 +6,8 @@
 #include "nodes/common/Caps.h"
 #include "nodes/io/InputAppSrc.h"
 #include "pipeline/PipelineSession.h"
+#include "pipeline/NeatTensorAdapters.h"
 #include "pipeline/internal/GstDiagnosticsUtil.h"
-#include "pipeline/internal/TensorUtil.h"
 #include "pipeline/internal/SimaaiGuard.h"
 
 #include <gst/app/gstappsink.h>
@@ -103,6 +103,10 @@ OutputSpec spec_from_caps(GstCaps* caps) {
   } else if (out.media_type == "application/vnd.simaai.tensor") {
     if (out.format == "FP32" || out.format == "DETESSDEQUANT") out.dtype = "Float32";
     if (out.format == "DETESS") out.dtype = "UInt16";
+    if (out.format == "EVXX_INT8" || out.format == "INT8") out.dtype = "Int8";
+    if (out.format == "EVXX_BFLOAT16" || out.format == "BF16" || out.format == "BFLOAT16") {
+      out.dtype = "BFloat16";
+    }
     if (out.width > 0 && out.height > 0 && out.depth > 0) out.layout = "HWC";
   }
 
@@ -123,9 +127,46 @@ OutputSpec spec_from_caps_string(const std::string& caps_string) {
   return out;
 }
 
-std::size_t tensor_byte_size(const FrameTensor& t) {
-  std::size_t total = 0;
-  for (const auto& p : t.planes) total += p.size();
+std::size_t tensor_byte_size(const NeatTensor& t) {
+  if (t.storage && t.storage->size_bytes > 0) return t.storage->size_bytes;
+  auto elem = [](TensorDType dtype) -> std::size_t {
+    switch (dtype) {
+      case TensorDType::UInt8: return 1;
+      case TensorDType::Int8: return 1;
+      case TensorDType::UInt16: return 2;
+      case TensorDType::Int16: return 2;
+      case TensorDType::Int32: return 4;
+      case TensorDType::BFloat16: return 2;
+      case TensorDType::Float32: return 4;
+      case TensorDType::Float64: return 8;
+    }
+    return 1;
+  };
+  const std::size_t elem_bytes = elem(t.dtype);
+  if (t.is_composite()) {
+    std::size_t total = 0;
+    for (const auto& p : t.planes) {
+      if (p.shape.size() >= 2 && !p.strides_bytes.empty()) {
+        total += static_cast<std::size_t>(p.strides_bytes[0]) *
+                 static_cast<std::size_t>(p.shape[0]);
+        continue;
+      }
+      if (p.shape.size() >= 2) {
+        total += static_cast<std::size_t>(p.shape[0]) *
+                 static_cast<std::size_t>(p.shape[1]) * elem_bytes;
+        continue;
+      }
+      if (!p.shape.empty()) {
+        total += static_cast<std::size_t>(p.shape[0]) * elem_bytes;
+      }
+    }
+    return total;
+  }
+  std::size_t total = elem_bytes;
+  for (auto dim : t.shape) {
+    if (dim <= 0) return 0;
+    total *= static_cast<std::size_t>(dim);
+  }
   return total;
 }
 
@@ -137,16 +178,24 @@ bool is_video_media_type(const OutputSpec& spec) {
   return spec.media_type == "video/x-raw";
 }
 
-FrameTensor tensor_from_packet(const TapPacket& pkt, const OutputSpec& spec) {
-  FrameTensor out;
-  out.caps_string = pkt.caps_string;
-  out.pts_ns = pkt.pts_ns;
-  out.dts_ns = pkt.dts_ns;
-  out.duration_ns = pkt.duration_ns;
-  out.keyframe = pkt.keyframe;
-
+NeatTensor tensor_from_packet(const TapPacket& pkt, const OutputSpec& spec) {
   const int w = pkt.video.width;
   const int h = pkt.video.height;
+
+  auto storage = make_cpu_owned_storage(pkt.bytes.size());
+  if (!pkt.bytes.empty()) {
+    NeatMapping mapping = storage->map(NeatMapMode::Write);
+    if (!mapping.data || mapping.size_bytes < pkt.bytes.size()) {
+      throw std::runtime_error("tensor_from_packet: failed to map storage");
+    }
+    std::memcpy(mapping.data, pkt.bytes.data(), pkt.bytes.size());
+  }
+
+  NeatTensor out;
+  out.storage = std::move(storage);
+  out.device = {NeatDeviceType::CPU, 0};
+  out.read_only = false;
+  out.byte_offset = 0;
 
   if (pkt.format == TapFormat::NV12) {
     if (w <= 0 || h <= 0) throw std::runtime_error("NV12: missing width/height");
@@ -156,16 +205,14 @@ FrameTensor tensor_from_packet(const TapPacket& pkt, const OutputSpec& spec) {
       throw std::runtime_error("NV12: byte size mismatch");
     }
     out.dtype = TensorDType::UInt8;
-    out.layout = TensorLayout::Planar;
-    out.format = "NV12";
-    out.width = w;
-    out.height = h;
     out.shape = {h, w};
-    out.strides = {w, 1};
-    out.planes.push_back(std::vector<uint8_t>(pkt.bytes.begin(),
-                                              pkt.bytes.begin() + static_cast<long>(y_sz)));
-    out.planes.push_back(std::vector<uint8_t>(pkt.bytes.begin() + static_cast<long>(y_sz),
-                                              pkt.bytes.end()));
+    out.strides_bytes = {w, 1};
+    NeatImageSpec image;
+    image.format = NeatImageSpec::PixelFormat::NV12;
+    out.semantic.image = image;
+    out.planes.push_back(NeatPlane{NeatPlaneRole::Y, {h, w}, {w, 1}, 0});
+    out.planes.push_back(NeatPlane{NeatPlaneRole::UV, {h / 2, w}, {w, 1},
+                                   static_cast<int64_t>(y_sz)});
     return out;
   }
 
@@ -178,18 +225,18 @@ FrameTensor tensor_from_packet(const TapPacket& pkt, const OutputSpec& spec) {
       throw std::runtime_error("I420: byte size mismatch");
     }
     out.dtype = TensorDType::UInt8;
-    out.layout = TensorLayout::Planar;
-    out.format = "I420";
-    out.width = w;
-    out.height = h;
     out.shape = {h, w};
-    out.strides = {w, 1};
-    auto it = pkt.bytes.begin();
-    out.planes.push_back(std::vector<uint8_t>(it, it + static_cast<long>(y_sz)));
-    it += static_cast<long>(y_sz);
-    out.planes.push_back(std::vector<uint8_t>(it, it + static_cast<long>(u_sz)));
-    it += static_cast<long>(u_sz);
-    out.planes.push_back(std::vector<uint8_t>(it, it + static_cast<long>(v_sz)));
+    out.strides_bytes = {w, 1};
+    NeatImageSpec image;
+    image.format = NeatImageSpec::PixelFormat::I420;
+    out.semantic.image = image;
+    const int64_t y_bytes = static_cast<int64_t>(y_sz);
+    const int64_t u_bytes = static_cast<int64_t>(u_sz);
+    out.planes.push_back(NeatPlane{NeatPlaneRole::Y, {h, w}, {w, 1}, 0});
+    out.planes.push_back(NeatPlane{NeatPlaneRole::U, {h / 2, w / 2},
+                                   {w / 2, 1}, y_bytes});
+    out.planes.push_back(NeatPlane{NeatPlaneRole::V, {h / 2, w / 2},
+                                   {w / 2, 1}, y_bytes + u_bytes});
     return out;
   }
 
@@ -198,13 +245,13 @@ FrameTensor tensor_from_packet(const TapPacket& pkt, const OutputSpec& spec) {
     const std::size_t sz = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3;
     if (pkt.bytes.size() != sz) throw std::runtime_error("RGB/BGR: byte size mismatch");
     out.dtype = TensorDType::UInt8;
-    out.layout = TensorLayout::HWC;
-    out.format = (pkt.format == TapFormat::RGB) ? "RGB" : "BGR";
-    out.width = w;
-    out.height = h;
     out.shape = {h, w, 3};
-    out.strides = {w * 3, 3, 1};
-    out.planes.push_back(pkt.bytes);
+    out.strides_bytes = {w * 3, 3, 1};
+    NeatImageSpec image;
+    image.format = (pkt.format == TapFormat::RGB)
+        ? NeatImageSpec::PixelFormat::RGB
+        : NeatImageSpec::PixelFormat::BGR;
+    out.semantic.image = image;
     return out;
   }
 
@@ -213,30 +260,61 @@ FrameTensor tensor_from_packet(const TapPacket& pkt, const OutputSpec& spec) {
     const std::size_t sz = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
     if (pkt.bytes.size() != sz) throw std::runtime_error("GRAY8: byte size mismatch");
     out.dtype = TensorDType::UInt8;
-    out.layout = TensorLayout::HW;
-    out.format = "GRAY8";
-    out.width = w;
-    out.height = h;
     out.shape = {h, w};
-    out.strides = {w, 1};
-    out.planes.push_back(pkt.bytes);
+    out.strides_bytes = {w, 1};
+    NeatImageSpec image;
+    image.format = NeatImageSpec::PixelFormat::GRAY8;
+    out.semantic.image = image;
     return out;
   }
 
   if (is_tensor_media_type(spec)) {
-    out.format = spec.format;
-    out.width = spec.width;
-    out.height = spec.height;
-    out.dtype = (spec.dtype == "Float32") ? TensorDType::Float32 : TensorDType::UInt16;
-    if (spec.depth > 0 && spec.width > 0 && spec.height > 0) {
-      out.layout = TensorLayout::HWC;
-      out.shape = {spec.height, spec.width, spec.depth};
-      const int row_stride = spec.width * spec.depth;
-      out.strides = {row_stride, spec.depth, 1};
+    const std::string dtype = upper_copy(spec.dtype);
+    if (dtype == "FLOAT32" || dtype == "FP32") {
+      out.dtype = TensorDType::Float32;
+    } else if (dtype == "INT8") {
+      out.dtype = TensorDType::Int8;
+    } else if (dtype == "BF16" || dtype == "BFLOAT16") {
+      out.dtype = TensorDType::BFloat16;
+    } else if (dtype == "UINT16") {
+      out.dtype = TensorDType::UInt16;
+    } else if (dtype == "UINT8") {
+      out.dtype = TensorDType::UInt8;
     } else {
-      out.layout = TensorLayout::Unknown;
+      out.dtype = TensorDType::UInt8;
     }
-    out.planes.push_back(pkt.bytes);
+
+    const int64_t elem = [&]() -> int64_t {
+      switch (out.dtype) {
+        case TensorDType::UInt8: return 1;
+        case TensorDType::Int8: return 1;
+        case TensorDType::UInt16: return 2;
+        case TensorDType::Int16: return 2;
+        case TensorDType::Int32: return 4;
+        case TensorDType::BFloat16: return 2;
+        case TensorDType::Float32: return 4;
+        case TensorDType::Float64: return 8;
+      }
+      return 1;
+    }();
+
+    if (spec.depth > 0 && spec.width > 0 && spec.height > 0) {
+      out.shape = {spec.height, spec.width, spec.depth};
+      out.strides_bytes = {spec.width * spec.depth * elem, spec.depth * elem, elem};
+    } else if (spec.width > 0 && spec.height > 0) {
+      out.shape = {spec.height, spec.width};
+      out.strides_bytes = {spec.width * elem, elem};
+    } else if (!pkt.bytes.empty()) {
+      const std::size_t count = pkt.bytes.size() / static_cast<std::size_t>(elem);
+      out.shape = {static_cast<int64_t>(count)};
+      out.strides_bytes = {elem};
+    }
+
+    if (!spec.format.empty()) {
+      NeatTessSpec tess;
+      tess.format = spec.format;
+      out.semantic.tess = tess;
+    }
     return out;
   }
 
@@ -333,8 +411,7 @@ debug::DebugOutput output_from_sample(GstSample* sample,
 
   bool tensor_ok = false;
   try {
-    FrameTensorRef ref = pipeline_internal::sample_to_tensor_ref(sample);
-    out.tensor = ref.to_copy();
+    out.tensor = from_gst_sample(sample);
     out.tensorizable = true;
     tensor_ok = true;
   } catch (const std::exception& e) {
@@ -448,6 +525,10 @@ void configure_appsrc(GstElement* appsrc, const sima::InputAppSrcOptions& opt) {
                nullptr);
 }
 
+bool appsrc_has_explicit_caps(const InputAppSrcOptions& opt) {
+  return !opt.format.empty() || opt.width > 0 || opt.height > 0 || opt.depth > 0;
+}
+
 OutputSpec spec_from_appsrc_options(const InputAppSrcOptions& opt) {
   OutputSpec out;
   out.media_type = opt.media_type.empty() ? "video/x-raw" : opt.media_type;
@@ -499,15 +580,106 @@ GstCaps* build_caps_from_spec(const OutputSpec& spec) {
   return nullptr;
 }
 
-std::vector<uint8_t> flatten_tensor(const FrameTensor& t) {
+namespace {
+
+std::string dtype_to_format(TensorDType dtype) {
+  switch (dtype) {
+    case TensorDType::UInt8: return "UINT8";
+    case TensorDType::Int8: return "INT8";
+    case TensorDType::UInt16: return "UINT16";
+    case TensorDType::Int16: return "INT16";
+    case TensorDType::Int32: return "INT32";
+    case TensorDType::BFloat16: return "BF16";
+    case TensorDType::Float32: return "FP32";
+    case TensorDType::Float64: return "FP64";
+  }
+  return "UINT8";
+}
+
+std::string format_from_neat_tensor(const NeatTensor& t) {
+  if (t.semantic.image.has_value()) {
+    switch (t.semantic.image->format) {
+      case NeatImageSpec::PixelFormat::RGB: return "RGB";
+      case NeatImageSpec::PixelFormat::BGR: return "BGR";
+      case NeatImageSpec::PixelFormat::GRAY8: return "GRAY8";
+      case NeatImageSpec::PixelFormat::NV12: return "NV12";
+      case NeatImageSpec::PixelFormat::I420: return "I420";
+      case NeatImageSpec::PixelFormat::UNKNOWN: break;
+    }
+  }
+  if (t.semantic.tess.has_value() && !t.semantic.tess->format.empty()) {
+    return upper_copy(t.semantic.tess->format);
+  }
+  return dtype_to_format(t.dtype);
+}
+
+int neat_width(const NeatTensor& t) {
+  if (t.shape.size() > 1) return static_cast<int>(t.shape[1]);
+  for (const auto& plane : t.planes) {
+    if (plane.role == NeatPlaneRole::Y && plane.shape.size() > 1) {
+      return static_cast<int>(plane.shape[1]);
+    }
+  }
+  return -1;
+}
+
+int neat_height(const NeatTensor& t) {
+  if (!t.shape.empty()) return static_cast<int>(t.shape[0]);
+  for (const auto& plane : t.planes) {
+    if (plane.role == NeatPlaneRole::Y && !plane.shape.empty()) {
+      return static_cast<int>(plane.shape[0]);
+    }
+  }
+  return -1;
+}
+
+int neat_depth(const NeatTensor& t) {
+  if (t.shape.size() >= 3) return static_cast<int>(t.shape[2]);
+  if (t.semantic.image.has_value()) {
+    switch (t.semantic.image->format) {
+      case NeatImageSpec::PixelFormat::RGB:
+      case NeatImageSpec::PixelFormat::BGR:
+        return 3;
+      case NeatImageSpec::PixelFormat::GRAY8:
+        return 1;
+      default:
+        break;
+    }
+  }
+  return -1;
+}
+
+std::string layout_from_neat_tensor(const NeatTensor& t) {
+  if (t.semantic.image.has_value()) {
+    switch (t.semantic.image->format) {
+      case NeatImageSpec::PixelFormat::NV12:
+      case NeatImageSpec::PixelFormat::I420:
+        return "Planar";
+      case NeatImageSpec::PixelFormat::GRAY8:
+        return "HW";
+      case NeatImageSpec::PixelFormat::RGB:
+      case NeatImageSpec::PixelFormat::BGR:
+        return "HWC";
+      default:
+        break;
+    }
+  }
+  if (t.shape.size() == 3) return "HWC";
+  if (t.shape.size() == 2) return "HW";
+  return "";
+}
+
+} // namespace
+
+std::vector<uint8_t> flatten_tensor(const NeatTensor& t) {
   std::vector<uint8_t> out;
-  if (t.planes.empty()) return out;
-  if (t.planes.size() == 1) {
-    return t.planes[0];
-  }
-  for (const auto& p : t.planes) {
-    out.insert(out.end(), p.begin(), p.end());
-  }
+  if (!t.storage) return out;
+  NeatMapping mapping = t.map(NeatMapMode::Read);
+  if (!mapping.data || mapping.size_bytes == 0) return out;
+  std::size_t bytes = tensor_byte_size(t);
+  if (bytes == 0 || bytes > mapping.size_bytes) bytes = mapping.size_bytes;
+  out.resize(bytes);
+  std::memcpy(out.data(), mapping.data, bytes);
   return out;
 }
 
@@ -515,17 +687,15 @@ OutputSpec input_spec_from_debug(const debug::DebugOutput& input) {
   if (input.tensor.has_value()) {
     const auto& t = *input.tensor;
     OutputSpec out;
-    out.width = t.width;
-    out.height = t.height;
-    out.format = t.format;
-    out.dtype = (t.dtype == TensorDType::Float32) ? "Float32" : "UInt8";
-    if (t.layout == TensorLayout::HWC) out.layout = "HWC";
-    if (t.layout == TensorLayout::HW) out.layout = "HW";
-    if (t.layout == TensorLayout::Planar) out.layout = "Planar";
-    out.media_type = (t.format == "FP32" || t.format == "DETESS" || t.format == "DETESSDEQUANT")
-        ? "application/vnd.simaai.tensor"
-        : "video/x-raw";
-    if (t.shape.size() == 3) out.depth = static_cast<int>(t.shape[2]);
+    out.width = neat_width(t);
+    out.height = neat_height(t);
+    out.depth = neat_depth(t);
+    out.format = format_from_neat_tensor(t);
+    out.dtype = upper_copy(dtype_to_format(t.dtype));
+    out.layout = layout_from_neat_tensor(t);
+    out.media_type = t.semantic.image.has_value()
+        ? "video/x-raw"
+        : "application/vnd.simaai.tensor";
     out.byte_size = tensor_byte_size(t);
     out.certainty = SpecCertainty::Derived;
     out.note = "input tensor";
@@ -609,6 +779,12 @@ PipelineHandle launch_pipeline(const std::string& pipeline_str,
   if (plugin_path) debug_log(std::string(where) + " GST_PLUGIN_PATH=" + plugin_path);
   if (registry) debug_log(std::string(where) + " GST_REGISTRY=" + registry);
   if (registry_1_0) debug_log(std::string(where) + " GST_REGISTRY_1_0=" + registry_1_0);
+
+  if (pipeline_internal::pipeline_uses_mla(pipeline_str)) {
+    // Only one MLA pipeline per process; debug pipelines should respect it too.
+    const void* owner = new int(0);
+    pipeline_internal::enforce_single_mla_pipeline(where, pipeline_str, owner, "DebugOverloads");
+  }
 
   std::string guard_err;
   h.guard = pipeline_internal::acquire_simaai_guard(where, pipeline_str,
@@ -747,7 +923,6 @@ debug::DebugOutput run_with_input_once(const NodeGroup& group,
   }
   gst_app_src_set_caps(GST_APP_SRC(h.appsrc), caps);
   gst_caps_unref(caps);
-  configure_appsrc(h.appsrc, src_opt);
 
   std::vector<uint8_t> bytes;
   if (input.tensor.has_value()) {
@@ -758,6 +933,12 @@ debug::DebugOutput run_with_input_once(const NodeGroup& group,
   if (bytes.empty()) {
     throw std::runtime_error(std::string(where) + ": empty input buffer");
   }
+
+  InputAppSrcOptions used = src_opt;
+  if (used.max_bytes == 0 && !appsrc_has_explicit_caps(used)) {
+    used.max_bytes = bytes.size();
+  }
+  configure_appsrc(h.appsrc, used);
 
   InputBufferPoolGuard pool_guard;
   GstBuffer* buf = allocate_input_buffer(bytes.size(), src_opt, pool_guard);
@@ -807,15 +988,6 @@ struct StreamBridge {
     OutputSpec input_spec = input_spec_from_debug(*in);
     check_input_vs_expected(input_spec, expected_in, dbg);
 
-    if (!caps_set) {
-      GstCaps* caps = build_caps_from_spec(expected_in);
-      if (!caps) throw std::runtime_error("debug::stream: unsupported input caps");
-      gst_app_src_set_caps(GST_APP_SRC(handle->appsrc), caps);
-      gst_caps_unref(caps);
-      configure_appsrc(handle->appsrc, src_opt);
-      caps_set = true;
-    }
-
     std::vector<uint8_t> bytes;
     if (in->tensor.has_value()) {
       bytes = flatten_tensor(*in->tensor);
@@ -825,6 +997,19 @@ struct StreamBridge {
     if (bytes.empty()) {
       if (dbg.strict) throw std::runtime_error("debug::stream: empty input buffer");
       return std::nullopt;
+    }
+
+    if (!caps_set) {
+      GstCaps* caps = build_caps_from_spec(expected_in);
+      if (!caps) throw std::runtime_error("debug::stream: unsupported input caps");
+      gst_app_src_set_caps(GST_APP_SRC(handle->appsrc), caps);
+      gst_caps_unref(caps);
+      InputAppSrcOptions used = src_opt;
+      if (used.max_bytes == 0 && !appsrc_has_explicit_caps(used)) {
+        used.max_bytes = bytes.size();
+      }
+      configure_appsrc(handle->appsrc, used);
+      caps_set = true;
     }
 
     InputBufferPoolGuard pool_guard;
@@ -1078,7 +1263,13 @@ debug::DebugOutput InputAppSrc(const cv::Mat& input,
   };
 
   InputAppSrcOptions used = opt;
-  used.media_type = used.media_type.empty() ? "video/x-raw" : used.media_type;
+  if (used.media_type.empty()) {
+    if (input.type() == CV_32FC1 || input.type() == CV_32FC3) {
+      used.media_type = "application/vnd.simaai.tensor";
+    } else {
+      used.media_type = "video/x-raw";
+    }
+  }
 
   const int in_w = input.cols;
   const int in_h = input.rows;
@@ -1132,33 +1323,50 @@ debug::DebugOutput InputAppSrc(const cv::Mat& input,
     throw std::runtime_error("debug::InputAppSrc: failed to extract input bytes");
   }
 
-  FrameTensor tensor;
-  tensor.width = used.width;
-  tensor.height = used.height;
-  tensor.format = used.format;
+  NeatTensor tensor;
+  tensor.storage = make_cpu_owned_storage(bytes.size());
+  if (!bytes.empty()) {
+    NeatMapping mapping = tensor.storage->map(NeatMapMode::Write);
+    if (!mapping.data || mapping.size_bytes < bytes.size()) {
+      throw std::runtime_error("debug::InputAppSrc: failed to map tensor storage");
+    }
+    std::memcpy(mapping.data, bytes.data(), bytes.size());
+  }
+  tensor.device = {NeatDeviceType::CPU, 0};
+  tensor.read_only = false;
+  tensor.byte_offset = 0;
 
   if (used.media_type == "video/x-raw") {
     tensor.dtype = TensorDType::UInt8;
     if (used.format == "RGB" || used.format == "BGR") {
-      tensor.layout = TensorLayout::HWC;
-      tensor.shape = {tensor.height, tensor.width, used.depth};
-      const int row_stride = tensor.width * used.depth;
-      tensor.strides = {row_stride, used.depth, 1};
+      tensor.shape = {used.height, used.width, used.depth};
+      tensor.strides_bytes = {used.width * used.depth, used.depth, 1};
+      NeatImageSpec image;
+      image.format = (used.format == "RGB")
+          ? NeatImageSpec::PixelFormat::RGB
+          : NeatImageSpec::PixelFormat::BGR;
+      tensor.semantic.image = image;
     } else {
-      tensor.layout = TensorLayout::HW;
-      tensor.shape = {tensor.height, tensor.width};
-      tensor.strides = {tensor.width, 1};
+      tensor.shape = {used.height, used.width};
+      tensor.strides_bytes = {used.width, 1};
+      NeatImageSpec image;
+      image.format = NeatImageSpec::PixelFormat::GRAY8;
+      tensor.semantic.image = image;
     }
   } else {
     tensor.dtype = TensorDType::Float32;
-    tensor.layout = TensorLayout::HWC;
-    tensor.shape = {tensor.height, tensor.width, used.depth};
-    const int elem = static_cast<int>(sizeof(float));
-    const int row_stride = tensor.width * used.depth * elem;
-    tensor.strides = {row_stride, used.depth * elem, elem};
+    tensor.shape = {used.height, used.width, used.depth};
+    const int64_t elem = static_cast<int64_t>(sizeof(float));
+    tensor.strides_bytes = {used.width * used.depth * elem,
+                            used.depth * elem,
+                            elem};
+    if (!used.format.empty()) {
+      NeatTessSpec tess;
+      tess.format = used.format;
+      tensor.semantic.tess = tess;
+    }
   }
 
-  tensor.planes.push_back(std::move(bytes));
   out.tensor = std::move(tensor);
   out.tensorizable = true;
   out.unknown = false;

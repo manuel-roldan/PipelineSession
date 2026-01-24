@@ -1,15 +1,35 @@
 #pragma once
 
+#include "sima/builder/ConfigJsonOverride.h"
+#include "sima/builder/ConfigJsonProvider.h"
+#include "sima/builder/NextCpuConfigurable.h"
 #include "sima/builder/Node.h"
 #include "sima/builder/OutputSpec.h"
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace sima {
 
+namespace mpk {
+class ModelMPK;
+} // namespace mpk
+} // namespace sima
+
+namespace simaai {
+class ModelSession;
+}
+
+namespace sima {
+
 struct PreprocOptions {
+  PreprocOptions() = default;
+  explicit PreprocOptions(const sima::mpk::ModelMPK& model);
+  explicit PreprocOptions(const simaai::ModelSession& model);
+
   int input_width = 1280;
   int input_height = 720;
   int output_width = 640;
@@ -48,7 +68,7 @@ struct PreprocOptions {
   std::string graph_name = "preproc";
   std::string node_name = "preproc";
   std::string cpu = "CVU";
-  std::string next_cpu = "MLA";
+  std::string next_cpu = "CVU";
   std::string debug = "EVXX_DBG_DISABLED";
 
   std::string upstream_name = "decoder";
@@ -61,9 +81,14 @@ struct PreprocOptions {
   std::string config_path;
   std::string config_dir;
   bool keep_config = false;
+  std::optional<nlohmann::json> config_json;
 };
 
-class Preproc final : public Node, public OutputSpecProvider {
+class Preproc final : public Node,
+                      public OutputSpecProvider,
+                      public ConfigJsonProvider,
+                      public ConfigJsonOverride,
+                      public NextCpuConfigurable {
 public:
   explicit Preproc(PreprocOptions opt = {});
 
@@ -71,9 +96,13 @@ public:
   std::string gst_fragment(int node_index) const override;
   std::vector<std::string> element_names(int node_index) const override;
   OutputSpec output_spec(const OutputSpec& input) const override;
+  bool set_next_cpu_if_auto(const std::string& next_cpu) override;
+  bool override_config_json(const std::function<void(nlohmann::json&)>& edit,
+                            const std::string& tag) override;
 
   const PreprocOptions& options() const { return opt_; }
   const std::string& config_path() const { return config_path_; }
+  const nlohmann::json* config_json() const override;
 
 private:
   struct PreprocConfigHolder;

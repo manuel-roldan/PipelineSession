@@ -4,7 +4,7 @@
 #include "pipeline/Errors.h"
 #include "pipeline/internal/Diagnostics.h"
 #include "pipeline/internal/GstDiagnosticsUtil.h"
-#include "pipeline/internal/TensorUtil.h"
+#include "pipeline/NeatTensorAdapters.h"
 
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
@@ -68,7 +68,7 @@ void TensorStream::close() {
   guard_.reset();
 }
 
-std::optional<FrameTensorRef> TensorStream::next(int timeout_ms) {
+std::optional<NeatTensor> TensorStream::next(int timeout_ms) {
   if (!appsink_) return std::nullopt;
 
   auto diag = diag_as_ctx(diag_);
@@ -90,7 +90,8 @@ std::optional<FrameTensorRef> TensorStream::next(int timeout_ms) {
   }
 
   GstSample* sample = *sample_opt;
-  FrameTensorRef out = pipeline_internal::sample_to_tensor_ref(sample);
+  NeatTensor out = from_gst_sample(sample);
+  gst_sample_unref(sample);
 
   if (pipeline_ && diag) {
     pipeline_internal::drain_bus(pipeline_, diag, "TensorStream::next(post)");
@@ -100,10 +101,10 @@ std::optional<FrameTensorRef> TensorStream::next(int timeout_ms) {
   return out;
 }
 
-std::optional<FrameTensor> TensorStream::next_copy(int timeout_ms) {
+std::optional<NeatTensor> TensorStream::next_copy(int timeout_ms) {
   auto ref = next(timeout_ms);
   if (!ref.has_value()) return std::nullopt;
-  return ref->to_copy();
+  return ref->clone();
 }
 
 PipelineReport TensorStream::report_snapshot(bool heavy) const {

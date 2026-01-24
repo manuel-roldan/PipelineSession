@@ -37,12 +37,15 @@ std::size_t bytes_per_element_from_dtype(const std::string& dtype) {
   if (dtype == "UInt16" || dtype == "Int16") return 2;
   if (dtype == "Int32" || dtype == "Float32") return 4;
   if (dtype == "Float64") return 8;
+  if (dtype == "BFloat16") return 2;
   return 0;
 }
 
 std::size_t bytes_per_element_from_format(const std::string& fmt) {
   if (fmt == "FP32" || fmt == "DETESSDEQUANT") return 4;
   if (fmt == "DETESS") return 2;
+  if (fmt == "EVXX_INT8" || fmt == "INT8") return 1;
+  if (fmt == "EVXX_BFLOAT16" || fmt == "BF16" || fmt == "BFLOAT16") return 2;
   return 0;
 }
 

@@ -1,13 +1,12 @@
 #pragma once
 
+#include "pipeline/Deprecated.h"
 #include "sima/builder/Node.h"
 #include "sima/builder/NodeGroup.h"
 #include "sima/pipeline/PipelineOptions.h"
 #include "sima/pipeline/TapStream.h"
-#include "sima/pipeline/FrameStream.h"
 #include "sima/pipeline/TensorStream.h"
-#include "sima/pipeline/InputStream.h"
-#include "sima/pipeline/AsyncStream.h"
+#include "sima/pipeline/PipelineRun.h"
 #include "sima/builder/GraphPrinter.h"
 #include "sima/nodes/common/AppSink.h"
 #include "sima/nodes/common/Caps.h"
@@ -67,8 +66,8 @@ private:
 
 class PipelineSession {
 public:
-  using FrameCallback = std::function<bool(const FrameNV12Ref&)>;
-  using TensorCallback = std::function<bool(const FrameTensorRef&)>;
+  using FrameCallback = std::function<bool(const NeatTensor&)>;
+  using TensorCallback = std::function<bool(const NeatTensor&)>;
 
   explicit PipelineSession(const PipelineSessionOptions& opt = {});
   ~PipelineSession();
@@ -86,17 +85,26 @@ public:
   PipelineSession& gst(std::string fragment);
   PipelineSession& gst(std::string fragment, InputRole role);
 
-  // Typed runner: last node must be OutputAppSink() and negotiated into NV12.
+  // Typed runner: last node must be OutputAppSink().
   void run();
   TensorStream run_tensor();
   TapStream run_packet_stream();
   RunInputResult run(const cv::Mat& input);
   RunInputResult run(const cv::Mat& input, const RunInputOptions& opt);
-  InputStream run_input_stream(const cv::Mat& sample,
-                               const InputStreamOptions& opt = {});
-  AsyncStream run_async(const cv::Mat& sample,
-                        const AsyncOptions& async_opt = {},
-                        const InputStreamOptions& stream_opt = {});
+  RunInputResult run(const NeatTensor& input);
+  RunInputResult run(const NeatTensor& input, const RunInputOptions& opt);
+  PipelineRun build(const cv::Mat& input,
+                    const PipelineRunOptions& opt = {});
+  PipelineRun build(const cv::Mat& input, PipelineRunMode mode);
+  PipelineRun build(const cv::Mat& input,
+                    PipelineRunMode mode,
+                    const PipelineRunOptions& opt);
+  PipelineRun build(const NeatTensor& input,
+                    const PipelineRunOptions& opt = {});
+  PipelineRun build(const NeatTensor& input, PipelineRunMode mode);
+  PipelineRun build(const NeatTensor& input,
+                    PipelineRunMode mode,
+                    const PipelineRunOptions& opt);
   RunDebugResult run_debug(const RunDebugOptions& opt, const cv::Mat& input);
   PipelineReport validate(const ValidateOptions& opt, const cv::Mat& input) const;
 
@@ -128,17 +136,14 @@ public:
   // Output callbacks for source pipelines (used by run()).
   void set_frame_callback(FrameCallback cb);
   void set_tensor_callback(TensorCallback cb);
-  InputStreamStats last_input_stats() const;
-  std::string last_input_diagnostics() const;
 
   // Save/load pipeline config for reproducible runs.
   void save(const std::string& path) const;
   static PipelineSession load(const std::string& path);
 
-  // Build pipeline once (no frames processed). Source pipelines call build(),
-  // push pipelines use build(input) to configure caps.
-  void build();
-  void build(const cv::Mat& input, const RunInputOptions& opt = {});
+  // Build pipeline once (no frames processed) and return an async runner.
+  // Push pipelines use build(input) to configure appsrc caps.
+  PipelineRun build(const PipelineRunOptions& opt = {});
 
   const std::string& last_pipeline() const { return last_pipeline_; }
 
@@ -148,6 +153,7 @@ private:
     GstElement* sink = nullptr;
     std::shared_ptr<void> diag;
   };
+  struct RunCache;
 
   std::vector<std::shared_ptr<Node>> nodes_;
   std::string last_pipeline_;
@@ -156,14 +162,11 @@ private:
   FrameCallback frame_cb_;
   TensorCallback tensor_cb_;
   std::atomic<uint64_t> nodes_version_{0};
-  uint64_t cached_input_version_ = 0;
-  RunInputOptions cached_input_opts_{};
-  bool cached_input_opts_valid_ = false;
-  bool cached_input_timings_ = false;
-  InputStreamStats last_input_stats_{};
-  std::unique_ptr<InputStream> cached_input_;
   std::unique_ptr<BuiltState> built_;
+  std::unique_ptr<RunCache> run_cache_;
   uint64_t built_version_ = 0;
+
+  void build_cached_source();
 };
 
 } // namespace sima

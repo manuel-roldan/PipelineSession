@@ -1,9 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <memory>
-#include <string>
-#include <vector>
 
 namespace sima {
 
@@ -56,6 +53,7 @@ enum class TensorDType {
   UInt16,
   Int16,
   Int32,
+  BFloat16,
   Float32,
   Float64,
 };
@@ -66,56 +64,6 @@ enum class TensorLayout {
   CHW,
   HW,
   Planar,
-};
-
-struct TensorPlaneRef {
-  const uint8_t* data = nullptr;
-  int width = 0;
-  int height = 0;
-  int stride = 0;
-};
-
-struct FrameTensor {
-  TensorDType dtype = TensorDType::UInt8;
-  TensorLayout layout = TensorLayout::Unknown;
-  std::string format;
-  int width = 0;
-  int height = 0;
-  std::vector<int64_t> shape;
-  std::vector<int64_t> strides;
-  std::vector<std::vector<uint8_t>> planes;
-
-  int64_t pts_ns = -1;
-  int64_t dts_ns = -1;
-  int64_t duration_ns = -1;
-  bool keyframe = false;
-  std::string caps_string;
-};
-
-struct FrameTensorRef {
-  TensorDType dtype = TensorDType::UInt8;
-  TensorLayout layout = TensorLayout::Unknown;
-  std::string format;
-  int width = 0;
-  int height = 0;
-  std::vector<int64_t> shape;
-  std::vector<int64_t> strides;
-  std::vector<TensorPlaneRef> planes;
-
-  int64_t pts_ns = -1;
-  int64_t dts_ns = -1;
-  int64_t duration_ns = -1;
-  bool keyframe = false;
-  std::string caps_string;
-
-  // Keeps the mapped sample alive for zero-copy bindings (future Python layer).
-  std::shared_ptr<void> holder;
-
-  // Zero-copy DLPack export (CPU only). The caller must invoke the deleter
-  // on the returned object when done; the holder keeps the sample alive.
-  dlpack::DLManagedTensor* to_dlpack() const;
-
-  FrameTensor to_copy() const;
 };
 
 } // namespace sima

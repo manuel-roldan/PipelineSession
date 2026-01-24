@@ -12,12 +12,17 @@ struct RtspInputGroupOptions {
   int latency_ms = 200;
   bool tcp = true;
   int payload_type = 96;
+  int h264_parse_config_interval = -1;
+  int h264_fps = -1;
+  int h264_width = -1;
+  int h264_height = -1;
   bool insert_queue = true;
 
   int sima_allocator_type = 2;
   std::string out_format = "NV12";
   std::string decoder_name;
   bool decoder_raw_output = true;
+  std::string decoder_next_element;
 
   bool use_videoconvert = false;
   bool use_videoscale = false;

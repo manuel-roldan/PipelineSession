@@ -15,7 +15,7 @@ A C++17 framework for building, validating, running, and debugging GStreamer pip
 ## Build
 Requirements:
 - GStreamer (core, app, video, rtsp-server)
-- OpenCV (currently required by CMake)
+- OpenCV (required; convenience APIs enabled by default with `SIMA_WITH_OPENCV=ON`)
 
 Build:
 ```bash
@@ -27,6 +27,9 @@ Run tests:
 ```bash
 ctest --test-dir build
 ```
+
+OpenCV convenience: include `mpk/ModelMPKOpenCV.h` to use
+`ModelMPKOptions(const cv::Mat&)` when `SIMA_WITH_OPENCV=ON` (default).
 
 Note: MPK tests will download assets if missing (ResNet50 MPK + ImageNet goldfish image).
 Set `SIMA_RESNET50_TAR` to a local MPK tarball or run `sima-cli modelzoo get resnet_50`

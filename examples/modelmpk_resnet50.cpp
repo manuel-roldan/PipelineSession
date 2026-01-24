@@ -1,5 +1,8 @@
 #include "pipeline/PipelineSession.h"
 #include "mpk/ModelMPK.h"
+#if defined(SIMA_WITH_OPENCV)
+#include "mpk/ModelMPKOpenCV.h"
+#endif
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -31,9 +34,18 @@ int main(int argc, char** argv) {
 
   sima::PipelineSession p;
 
-  auto model = mpk::ModelMPK::load(
-      tar_gz,
-      mpk::ModelMPKOptions{false, {}, {}, rgb.cols, rgb.rows, "RGB", 0});
+#if defined(SIMA_WITH_OPENCV)
+  mpk::ModelMPKOptions mpk_opt(rgb);
+#else
+  sima::OutputSpec spec;
+  spec.media_type = "video/x-raw";
+  spec.format = "RGB";
+  spec.width = rgb.cols;
+  spec.height = rgb.rows;
+  mpk::ModelMPKOptions mpk_opt = mpk::options_from_output_spec(spec);
+#endif
+
+  auto model = mpk::ModelMPK::load(tar_gz, mpk_opt);
 
   p.add(nodes::InputAppSrc(model.input_appsrc_options(/*tensor_mode=*/false)));
   p.add(model.to_node_group(mpk::ModelStage::Full));

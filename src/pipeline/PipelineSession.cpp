@@ -10,15 +10,24 @@
 #include "pipeline/PipelineReport.h"
 #include "pipeline/TapStream.h"
 #include "pipeline/TensorStream.h"
+#include "internal/InputStream.h"
+#include "internal/InputStreamUtil.h"
 #include "pipeline/internal/Diagnostics.h"
+#include "pipeline/internal/DispatcherRecovery.h"
 #include "pipeline/internal/GstDiagnosticsUtil.h"
 #include "pipeline/internal/SimaaiGuard.h"
 #include "pipeline/internal/TensorUtil.h"
 #include "builder/Node.h"
 #include "builder/NodeGroup.h"
+#include "builder/ConfigJsonProvider.h"
+#include "builder/ConfigJsonConsumer.h"
+#include "builder/NextCpuConfigurable.h"
+#include "builder/OutputSpec.h"
 #include "builder/GraphPrinter.h"
 #include "contracts/ContractRegistry.h"
 #include "contracts/Validators.h"
+#include "pipeline/NeatTensor.h"
+#include "pipeline/NeatTensorAdapters.h"
 
 #include <gst/gst.h>
 #include <gst/gstdebugutils.h>
@@ -81,6 +90,11 @@ static bool env_bool(const char* key, bool def_val) {
     return false;
   }
   return def_val;
+}
+
+static void trace_step(const char* label) {
+  if (!env_bool("SIMA_DISPATCHER_TRACE", false)) return;
+  std::fprintf(stderr, "[TRACE] %s\n", label);
 }
 
 static std::string env_str(const char* key, const std::string& def_val = "") {
@@ -1073,15 +1087,229 @@ struct BuildResult {
   int tap_node_index = -1;
 };
 
+enum class RunInputKind {
+  Mat = 0,
+  NeatTensor,
+};
+
+struct PipelineSession::RunCache {
+  PipelineRun runner;
+  InputCapsConfig caps;
+  RunInputOptions opt;
+  uint64_t nodes_version = 0;
+  RunInputKind input_kind = RunInputKind::Mat;
+};
+
 static bool should_insert_boundaries_for_mode(const char* mode_key,
                                               bool def_val) {
   return env_bool(mode_key, def_val);
 }
 
+static std::string lower_copy(std::string s) {
+  for (char& c : s) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return s;
+}
+
+static constexpr int kAsyncQueue2Depth = 5;
+static const char* kAsyncQueue2Fragment =
+    "queue2 max-size-buffers=5 max-size-bytes=0 max-size-time=0";
+
+static bool fragment_contains(const std::shared_ptr<Node>& node,
+                              const std::string& needle) {
+  if (!node) return false;
+  const std::string frag = node->gst_fragment(0);
+  if (frag.empty()) return false;
+  const std::string lower = lower_copy(frag);
+  return lower.find(needle) != std::string::npos;
+}
+
+static bool caps_equal(const InputCapsConfig& a, const InputCapsConfig& b) {
+  return a.media_type == b.media_type &&
+         a.format == b.format &&
+         a.width == b.width &&
+         a.height == b.height &&
+         a.depth == b.depth &&
+         a.bytes == b.bytes;
+}
+
+static bool run_input_options_equal(const RunInputOptions& a, const RunInputOptions& b) {
+  return a.copy_output == b.copy_output &&
+         a.reuse_input_buffer == b.reuse_input_buffer &&
+         a.strict == b.strict;
+}
+
+static void enforce_mla_pipeline_guard(const char* where,
+                                       const std::string& pipeline,
+                                       const void* owner) {
+  pipeline_internal::enforce_single_mla_pipeline(
+      where ? where : "PipelineSession",
+      pipeline,
+      owner,
+      "PipelineSession");
+}
+
+static std::string infer_next_cpu(const std::vector<std::shared_ptr<Node>>& nodes,
+                                  size_t index) {
+  if (index >= nodes.size()) return "APU";
+
+  if (fragment_contains(nodes[index], "processmla")) return "MLA";
+
+  for (size_t j = index + 1; j < nodes.size(); ++j) {
+    if (fragment_contains(nodes[j], "processmla")) return "MLA";
+    if (fragment_contains(nodes[j], "processcvu")) return "CVU";
+  }
+  return "APU";
+}
+
+static void apply_auto_next_cpu(
+    const std::vector<std::shared_ptr<Node>>& nodes,
+    std::vector<pipeline_internal::NextCpuDecision>* decisions) {
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    auto* configurable = dynamic_cast<NextCpuConfigurable*>(nodes[i].get());
+    if (!configurable) continue;
+    const std::string next_cpu = infer_next_cpu(nodes, i);
+    const bool applied = configurable->set_next_cpu_if_auto(next_cpu);
+    if (decisions) {
+      pipeline_internal::NextCpuDecision d;
+      d.node_index = static_cast<int>(i);
+      d.node_kind = nodes[i] ? nodes[i]->kind() : "";
+      d.node_label = nodes[i] ? nodes[i]->user_label() : "";
+      d.next_cpu = next_cpu;
+      d.applied = applied;
+      decisions->push_back(std::move(d));
+    }
+  }
+}
+
+static void propagate_config_json(const std::vector<std::shared_ptr<Node>>& nodes) {
+  const nlohmann::json* last_cfg = nullptr;
+  std::string last_kind;
+  for (const auto& node : nodes) {
+    if (!node) continue;
+    if (auto* consumer = dynamic_cast<ConfigJsonConsumer*>(node.get())) {
+      if (last_cfg) {
+        consumer->apply_upstream_config(*last_cfg, last_kind);
+      }
+    }
+    if (auto* provider = dynamic_cast<ConfigJsonProvider*>(node.get())) {
+      const nlohmann::json* cfg = provider->config_json();
+      if (cfg) {
+        last_cfg = cfg;
+        last_kind = node->kind();
+      } else {
+        last_cfg = nullptr;
+        last_kind.clear();
+      }
+    }
+  }
+}
+
+static InputStream run_input_stream_internal(const std::vector<std::shared_ptr<Node>>& nodes,
+                                             const std::shared_ptr<void>& guard,
+                                             const void* owner,
+                                             std::string& last_pipeline,
+                                             const cv::Mat& sample,
+                                             const InputStreamOptions& opt,
+                                             bool insert_queue2,
+                                             bool sync_mode);
+static InputStream run_input_stream_internal(const std::vector<std::shared_ptr<Node>>& nodes,
+                                             const std::shared_ptr<void>& guard,
+                                             const void* owner,
+                                             std::string& last_pipeline,
+                                             const NeatTensor& sample,
+                                             const InputStreamOptions& opt,
+                                             bool insert_queue2,
+                                             bool sync_mode);
+
+static PipelineRunOptions sync_run_defaults() {
+  PipelineRunOptions opt;
+  opt.input_queue = 1;
+  opt.output_queue = 1;
+  opt.drop = DropPolicy::Block;
+  opt.copy_output = true;
+  opt.copy_input = false;
+  opt.allow_mismatched_input = false;
+  opt.reuse_input_buffer = false;
+  opt.appsink_max_buffers = 1;
+  opt.appsink_drop = false;
+  opt.appsink_sync = false;
+  opt.preflight_run = true;
+  opt.poll_ms = 20;
+  return opt;
+}
+
+static PipelineRunOptions apply_run_defaults(const PipelineRunOptions& opt,
+                                             const PipelineSessionOptions& sess_opt) {
+  PipelineRunOptions out = opt;
+  out.auto_recover_dispatcher = out.auto_recover_dispatcher && sess_opt.auto_recover_dispatcher;
+  if (!out.on_dispatcher_error) out.on_dispatcher_error = sess_opt.on_dispatcher_error;
+  return out;
+}
+
+static InputStreamOptions make_stream_options(const PipelineRunOptions& opt) {
+  InputStreamOptions stream_opt;
+  stream_opt.appsink_sync = opt.appsink_sync;
+  stream_opt.appsink_drop = opt.appsink_drop;
+  if (opt.appsink_max_buffers > 0) {
+    stream_opt.appsink_max_buffers = opt.appsink_max_buffers;
+  } else if (opt.output_queue > 0) {
+    stream_opt.appsink_max_buffers = opt.output_queue;
+  } else {
+    stream_opt.appsink_max_buffers = 0;
+  }
+  stream_opt.allow_mismatched_input = opt.allow_mismatched_input;
+  stream_opt.copy_output = opt.copy_output;
+  stream_opt.no_map_tensor_ref = opt.no_map_tensor_ref;
+  stream_opt.reuse_input_buffer = opt.reuse_input_buffer;
+  stream_opt.enable_timings = opt.enable_timings;
+  stream_opt.timeout_ms = opt.timeout_ms;
+  stream_opt.preflight_run = opt.preflight_run;
+  stream_opt.poll_ms = opt.poll_ms;
+  return stream_opt;
+}
+
+static std::string clamp_num_buffers_for_plugin(std::string pipeline,
+                                                const std::string& plugin,
+                                                int max_val) {
+  const std::string key = "num-buffers=";
+  size_t pos = 0;
+  while ((pos = pipeline.find(plugin, pos)) != std::string::npos) {
+    size_t seg_end = pipeline.find('!', pos);
+    if (seg_end == std::string::npos) seg_end = pipeline.size();
+    size_t nb_pos = pipeline.find(key, pos);
+    if (nb_pos != std::string::npos && nb_pos < seg_end) {
+      const size_t val_start = nb_pos + key.size();
+      size_t val_end = val_start;
+      while (val_end < seg_end &&
+             std::isdigit(static_cast<unsigned char>(pipeline[val_end]))) {
+        ++val_end;
+      }
+      if (val_end > val_start) {
+        const int val = std::atoi(pipeline.substr(val_start, val_end - val_start).c_str());
+        if (val > max_val) {
+          pipeline.replace(val_start, val_end - val_start, std::to_string(max_val));
+        }
+      }
+    }
+    pos = seg_end;
+  }
+  return pipeline;
+}
+
+static std::string clamp_sync_pipeline(std::string pipeline) {
+  // simaaiprocesscvu allocates a pool with MIN_POOL_SIZE=2, so max must be >=2.
+  pipeline = clamp_num_buffers_for_plugin(std::move(pipeline), "simaaiprocesscvu", 2);
+  pipeline = clamp_num_buffers_for_plugin(std::move(pipeline), "simaaiprocessmla", 2);
+  return pipeline;
+}
+
 static BuildResult build_pipeline_full(
     const std::vector<std::shared_ptr<Node>>& nodes,
     bool insert_boundaries,
-    const std::string& appsink_name) {
+    const std::string& appsink_name,
+    bool insert_queue2) {
   if (nodes.empty()) {
     throw std::runtime_error("InvalidPipeline: no nodes");
   }
@@ -1089,6 +1317,11 @@ static BuildResult build_pipeline_full(
   BuildResult br;
   br.diag = std::make_shared<DiagCtx>();
   br.appsink_name = appsink_name;
+  br.diag->queue2_enabled = insert_queue2;
+  br.diag->queue2_depth = insert_queue2 ? kAsyncQueue2Depth : 0;
+
+  apply_auto_next_cpu(nodes, &br.diag->next_cpu_decisions);
+  propagate_config_json(nodes);
 
   std::ostringstream ss;
 
@@ -1102,7 +1335,17 @@ static BuildResult build_pipeline_full(
       throw std::runtime_error("InvalidPipeline: null node");
     }
 
-    if (i) ss << " ! ";
+    if (i) {
+      bool want_queue2 = insert_queue2;
+      if (insert_queue2 && nodes[i] && nodes[i]->kind() == "OutputAppSink") {
+        want_queue2 = false;
+      }
+      if (want_queue2) {
+        ss << " ! " << kAsyncQueue2Fragment << " ! ";
+      } else {
+        ss << " ! ";
+      }
+    }
 
     NodeReport nr;
     nr.index = (int)i;
@@ -1160,7 +1403,7 @@ static BuildResult build_pipeline_tap(
   std::vector<std::shared_ptr<Node>> trunc(
       nodes.begin(), nodes.begin() + (size_t)cut + 1);
 
-  BuildResult br = build_pipeline_full(trunc, insert_boundaries, tap_name);
+  BuildResult br = build_pipeline_full(trunc, insert_boundaries, tap_name, false);
   br.tap_node_index = cut;
   br.appsink_name = tap_name;
 
@@ -1181,6 +1424,35 @@ static void enforce_sink_last(const std::vector<std::shared_ptr<Node>>& nodes) {
   if (!nodes.back() || nodes.back()->kind() != "OutputAppSink") {
     throw std::runtime_error(
         "InvalidPipeline: last node must be OutputAppSink() for run()");
+  }
+}
+
+static int find_output_appsink_index(const std::vector<std::shared_ptr<Node>>& nodes) {
+  int found = -1;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (!nodes[i]) continue;
+    if (nodes[i]->kind() != "OutputAppSink") continue;
+    if (found >= 0) {
+      throw std::runtime_error("InvalidPipeline: multiple OutputAppSink nodes found");
+    }
+    found = static_cast<int>(i);
+  }
+  return found;
+}
+
+static bool has_output_appsink(const std::vector<std::shared_ptr<Node>>& nodes) {
+  return find_output_appsink_index(nodes) >= 0;
+}
+
+static void enforce_sink_last_if_present(const std::vector<std::shared_ptr<Node>>& nodes,
+                                         const std::string& where) {
+  if (nodes.empty()) {
+    throw std::runtime_error(where + ": no nodes");
+  }
+  const int sink_idx = find_output_appsink_index(nodes);
+  if (sink_idx < 0) return;
+  if (sink_idx != static_cast<int>(nodes.size() - 1)) {
+    throw std::runtime_error(where + ": OutputAppSink() must be the last node");
   }
 }
 
@@ -1264,15 +1536,6 @@ static void require_input_appsrc(const std::vector<std::shared_ptr<Node>>& nodes
   if (out_src) *out_src = src;
 }
 
-struct InputCapsConfig {
-  std::string media_type;
-  std::string format;
-  int width = -1;
-  int height = -1;
-  int depth = -1;
-  size_t bytes = 0;
-};
-
 static int max_num_buffers_in_pipeline(const std::string& pipeline) {
   const std::string key = "num-buffers=";
   int max_val = 0;
@@ -1303,181 +1566,6 @@ static void warn_run_input_num_buffers(const std::string& pipeline) {
                max_val);
 }
 
-static InputCapsConfig infer_input_caps(const InputAppSrcOptions& opt,
-                                        const cv::Mat& input) {
-  if (input.empty()) {
-    throw std::invalid_argument("run(input): input frame is empty");
-  }
-
-  InputCapsConfig out;
-  out.media_type = opt.media_type.empty() ? "video/x-raw" : opt.media_type;
-
-  const int in_w = input.cols;
-  const int in_h = input.rows;
-  const int in_c = input.channels();
-
-  const bool is_video = (out.media_type == "video/x-raw");
-  const bool is_tensor = (out.media_type == "application/vnd.simaai.tensor");
-
-  if (!is_video && !is_tensor) {
-    throw std::invalid_argument("run(input): unsupported media_type: " + out.media_type);
-  }
-
-  std::string fmt = upper_copy(opt.format);
-  if (is_video) {
-    if (fmt.empty()) {
-      fmt = (in_c == 1) ? "GRAY8" : "BGR";
-    }
-    if (fmt == "GRAY") fmt = "GRAY8";
-
-    if (fmt != "RGB" && fmt != "BGR" && fmt != "GRAY8") {
-      throw std::invalid_argument("run(input): unsupported video format: " + fmt);
-    }
-
-    if ((fmt == "RGB" || fmt == "BGR") && input.type() != CV_8UC3) {
-      throw std::invalid_argument("run(input): expected CV_8UC3 for video/x-raw " + fmt);
-    }
-    if (fmt == "GRAY8" && input.type() != CV_8UC1) {
-      throw std::invalid_argument("run(input): expected CV_8UC1 for video/x-raw GRAY8");
-    }
-
-    out.width = (opt.width > 0) ? opt.width : in_w;
-    out.height = (opt.height > 0) ? opt.height : in_h;
-    out.depth = (opt.depth > 0) ? opt.depth : in_c;
-    if (opt.width > 0 && opt.width != in_w) {
-      throw std::invalid_argument("run(input): input width does not match InputAppSrcOptions");
-    }
-    if (opt.height > 0 && opt.height != in_h) {
-      throw std::invalid_argument("run(input): input height does not match InputAppSrcOptions");
-    }
-    if (opt.depth > 0 && opt.depth != in_c) {
-      throw std::invalid_argument("run(input): input depth does not match InputAppSrcOptions");
-    }
-  } else {
-    if (fmt.empty()) fmt = "FP32";
-    if (fmt != "FP32") {
-      throw std::invalid_argument("run(input): only FP32 tensor input is supported");
-    }
-    if (input.type() != CV_32FC1 && input.type() != CV_32FC3) {
-      throw std::invalid_argument("run(input): tensor input must be CV_32FC1 or CV_32FC3");
-    }
-    out.width = (opt.width > 0) ? opt.width : in_w;
-    out.height = (opt.height > 0) ? opt.height : in_h;
-    out.depth = (opt.depth > 0) ? opt.depth : in_c;
-    if (opt.width > 0 && opt.width != in_w) {
-      throw std::invalid_argument("run(input): tensor input width does not match InputAppSrcOptions");
-    }
-    if (opt.height > 0 && opt.height != in_h) {
-      throw std::invalid_argument("run(input): tensor input height does not match InputAppSrcOptions");
-    }
-    if (opt.depth > 0 && opt.depth != in_c) {
-      throw std::invalid_argument("run(input): tensor input depth does not match InputAppSrcOptions");
-    }
-  }
-
-  out.format = fmt;
-  out.bytes = input.total() * input.elemSize();
-  return out;
-}
-
-static void validate_input_matches_caps(const InputCapsConfig& cfg,
-                                        const InputAppSrcOptions& opt,
-                                        const cv::Mat& input,
-                                        const char* where) {
-  if (input.empty()) {
-    throw std::invalid_argument(std::string(where) + ": input frame is empty");
-  }
-  if (input.cols != cfg.width || input.rows != cfg.height) {
-    throw std::invalid_argument(std::string(where) + ": input size does not match appsrc caps");
-  }
-
-  const bool is_video = (cfg.media_type == "video/x-raw");
-  const bool is_tensor = (cfg.media_type == "application/vnd.simaai.tensor");
-  if (!is_video && !is_tensor) {
-    throw std::invalid_argument(std::string(where) + ": unsupported media_type");
-  }
-
-  const std::string fmt = upper_copy(cfg.format);
-  if (is_video) {
-    if ((fmt == "RGB" || fmt == "BGR") && input.type() != CV_8UC3) {
-      throw std::invalid_argument(std::string(where) + ": expected CV_8UC3");
-    }
-    if (fmt == "GRAY8" && input.type() != CV_8UC1) {
-      throw std::invalid_argument(std::string(where) + ": expected CV_8UC1");
-    }
-  } else {
-    if (fmt != "FP32") {
-      throw std::invalid_argument(std::string(where) + ": only FP32 tensor input supported");
-    }
-    if (input.type() != CV_32FC1 && input.type() != CV_32FC3) {
-      throw std::invalid_argument(std::string(where) + ": tensor input must be CV_32FC1/CV_32FC3");
-    }
-  }
-
-  if (opt.depth > 0 && input.channels() != opt.depth) {
-    throw std::invalid_argument(std::string(where) + ": input channels do not match appsrc caps");
-  }
-
-  const size_t bytes = input.total() * input.elemSize();
-  if (bytes != cfg.bytes) {
-    throw std::invalid_argument(std::string(where) + ": input byte size mismatch");
-  }
-}
-
-static GstCaps* build_input_caps(const InputCapsConfig& cfg) {
-  if (cfg.media_type == "video/x-raw") {
-    if (cfg.depth > 0) {
-      return gst_caps_new_simple(
-          "video/x-raw",
-          "format", G_TYPE_STRING, cfg.format.c_str(),
-          "width", G_TYPE_INT, cfg.width,
-          "height", G_TYPE_INT, cfg.height,
-          "depth", G_TYPE_INT, cfg.depth,
-          nullptr);
-    }
-    return gst_caps_new_simple(
-        "video/x-raw",
-        "format", G_TYPE_STRING, cfg.format.c_str(),
-        "width", G_TYPE_INT, cfg.width,
-        "height", G_TYPE_INT, cfg.height,
-        nullptr);
-  }
-
-  return gst_caps_new_simple(
-      "application/vnd.simaai.tensor",
-      "format", G_TYPE_STRING, cfg.format.c_str(),
-      "width", G_TYPE_INT, cfg.width,
-      "height", G_TYPE_INT, cfg.height,
-      "depth", G_TYPE_INT, cfg.depth,
-      nullptr);
-}
-
-static void debug_pool_log(const char* msg) {
-  if (env_bool("SIMA_DEBUG_INPUT_POOL", false)) {
-    std::fprintf(stderr, "%s\n", msg);
-  }
-}
-
-static void debug_pool_timing(const char* stage,
-                              const InputAppSrcOptions& opt,
-                              size_t bytes,
-                              const std::chrono::steady_clock::time_point& start,
-                              bool ok,
-                              bool used_pool) {
-  if (!env_bool("SIMA_INPUTSTREAM_ALLOC_DEBUG", false)) return;
-  const auto end = std::chrono::steady_clock::now();
-  const double ms = std::chrono::duration<double, std::milli>(end - start).count();
-  std::fprintf(stderr,
-               "[DBG] input_buffer %s bytes=%zu pool=%s ok=%d min=%d max=%d ms=%.3f\n",
-               stage,
-               bytes,
-               used_pool ? "true" : "false",
-               ok ? 1 : 0,
-               opt.pool_min_buffers,
-               opt.pool_max_buffers,
-               ms);
-}
-
 static void configure_appsrc(GstElement* appsrc, const InputAppSrcOptions& opt) {
   if (!appsrc) return;
   g_object_set(G_OBJECT(appsrc),
@@ -1488,6 +1576,17 @@ static void configure_appsrc(GstElement* appsrc, const InputAppSrcOptions& opt) 
                "stream-type", opt.stream_type,
                "max-bytes", static_cast<guint64>(opt.max_bytes),
                nullptr);
+}
+
+static bool appsrc_has_explicit_caps(const InputAppSrcOptions& opt) {
+  return !opt.format.empty() || opt.width > 0 || opt.height > 0 || opt.depth > 0;
+}
+
+static std::uint64_t resolve_appsrc_max_bytes(const InputAppSrcOptions& opt,
+                                              const InputCapsConfig& cfg) {
+  if (opt.max_bytes > 0) return opt.max_bytes;
+  if (appsrc_has_explicit_caps(opt)) return opt.max_bytes;
+  return static_cast<std::uint64_t>(cfg.bytes);
 }
 
 static void maybe_log_element_props(GstElement* elem,
@@ -1578,207 +1677,6 @@ static void configure_appsink_for_input_stream(GstElement* appsink,
                nullptr);
 }
 
-struct InputBufferPoolGuard {
-#if SIMA_HAS_SIMAAI_POOL
-  std::unique_ptr<GstBufferPool, decltype(&gst_simaai_free_buffer_pool)> pool{
-      nullptr, gst_simaai_free_buffer_pool};
-#else
-  std::unique_ptr<GstBufferPool, void(*)(GstBufferPool*)> pool{nullptr, +[](GstBufferPool*) {}};
-#endif
-};
-
-static GstBuffer* allocate_input_buffer(size_t bytes,
-                                        const InputAppSrcOptions& opt,
-                                        InputBufferPoolGuard& guard) {
-#if SIMA_HAS_SIMAAI_POOL
-  if (opt.use_simaai_pool) {
-    GstBufferPool* pool = guard.pool.get();
-    if (!pool) {
-      const auto t_create_start = std::chrono::steady_clock::now();
-      gst_simaai_segment_memory_init_once();
-      GstMemoryFlags flags = static_cast<GstMemoryFlags>(
-          GST_SIMAAI_MEMORY_TARGET_EV74 | GST_SIMAAI_MEMORY_FLAG_CACHED);
-      GstBufferPool* new_pool = gst_simaai_allocate_buffer_pool(
-          /*allocator_user_data=*/nullptr,
-          gst_simaai_memory_get_segment_allocator(),
-          bytes,
-          opt.pool_min_buffers,
-          opt.pool_max_buffers,
-          flags);
-      if (new_pool) {
-        guard.pool.reset(new_pool);
-        pool = new_pool;
-      }
-      debug_pool_timing("pool_create", opt, bytes, t_create_start, pool != nullptr, true);
-    }
-
-    if (pool) {
-      const auto t_acquire_start = std::chrono::steady_clock::now();
-      GstBuffer* buf = nullptr;
-      if (gst_buffer_pool_acquire_buffer(pool, &buf, nullptr) == GST_FLOW_OK && buf) {
-        debug_pool_timing("pool_acquire", opt, bytes, t_acquire_start, true, true);
-        return buf;
-      }
-      debug_pool_timing("pool_acquire", opt, bytes, t_acquire_start, false, true);
-      debug_pool_log("InputAppSrc: simaai pool acquired but buffer allocation failed.");
-      return nullptr;
-    }
-    debug_pool_log("InputAppSrc: simaai pool allocation failed.");
-    return nullptr;
-  }
-#else
-  (void)opt;
-  (void)guard;
-#endif
-
-  const auto t_alloc_start = std::chrono::steady_clock::now();
-  GstBuffer* buf = gst_buffer_new_allocate(nullptr, bytes, nullptr);
-  debug_pool_timing("system_alloc", opt, bytes, t_alloc_start, buf != nullptr, false);
-  return buf;
-}
-
-static int64_t next_input_frame_id() {
-  static std::atomic<int64_t> next_id{0};
-  return next_id.fetch_add(1);
-}
-
-static bool maybe_add_simaai_meta(GstBuffer* buffer,
-                                  int64_t frame_id,
-                                  const InputAppSrcOptions& opt) {
-#if SIMA_HAS_SIMAAI_POOL
-  if (!buffer || !opt.use_simaai_pool) return false;
-  GstCustomMeta* meta = gst_buffer_get_custom_meta(buffer, "GstSimaMeta");
-  if (meta) {
-    GstStructure* s = gst_custom_meta_get_structure(meta);
-#if defined(GST_STRUCTURE_IS_WRITABLE)
-    if (!s || !GST_STRUCTURE_IS_WRITABLE(s)) {
-      gst_buffer_remove_meta(buffer, &meta->meta);
-      meta = nullptr;
-    }
-#else
-    if (!s) meta = nullptr;
-#endif
-  }
-  if (!meta) {
-    meta = gst_buffer_add_custom_meta(buffer, "GstSimaMeta");
-  }
-  if (!meta) {
-    if (env_bool("SIMA_INPUTSTREAM_META_DEBUG", false)) {
-      std::fprintf(stderr, "[DBG] GstSimaMeta add failed (buffer=%p)\n", buffer);
-    }
-    return false;
-  }
-  GstStructure* s = gst_custom_meta_get_structure(meta);
-  if (!s) {
-    if (env_bool("SIMA_INPUTSTREAM_META_DEBUG", false)) {
-      std::fprintf(stderr, "[DBG] GstSimaMeta missing structure (buffer=%p)\n", buffer);
-    }
-    return false;
-  }
-  const std::string name = opt.buffer_name.empty() ? "decoder" : opt.buffer_name;
-  gint64 phys_addr =
-      gst_simaai_segment_memory_get_phys_addr(gst_buffer_peek_memory(buffer, 0));
-  gst_structure_set(s,
-                    "buffer-id", G_TYPE_INT64, phys_addr,
-                    "buffer-name", G_TYPE_STRING, name.c_str(),
-                    "buffer-offset", G_TYPE_INT64, static_cast<gint64>(0),
-                    "frame-id", G_TYPE_INT64, static_cast<gint64>(frame_id),
-                    "stream-id", G_TYPE_STRING, "0",
-                    "timestamp", G_TYPE_UINT64, static_cast<guint64>(0),
-                    nullptr);
-  if (env_bool("SIMA_INPUTSTREAM_META_DEBUG", false)) {
-    std::fprintf(stderr,
-                 "[DBG] GstSimaMeta set name=%s phys=%lld frame=%lld\n",
-                 name.c_str(),
-                 static_cast<long long>(phys_addr),
-                 static_cast<long long>(frame_id));
-  }
-  return true;
-#else
-  (void)buffer;
-  (void)frame_id;
-  (void)opt;
-  return false;
-#endif
-}
-
-static void maybe_update_simaai_meta_name(GstBuffer* buffer, const std::string& name) {
-#if SIMA_HAS_SIMAAI_POOL
-  if (!buffer || name.empty()) return;
-  GstCustomMeta* meta = gst_buffer_get_custom_meta(buffer, "GstSimaMeta");
-  if (!meta) return;
-  GstStructure* s = gst_custom_meta_get_structure(meta);
-  if (!s) return;
-#if defined(GST_STRUCTURE_IS_WRITABLE)
-  if (!GST_STRUCTURE_IS_WRITABLE(s)) return;
-#else
-  return;
-#endif
-  gst_structure_set(s,
-                    "buffer-name", G_TYPE_STRING, name.c_str(),
-                    nullptr);
-#else
-  (void)buffer;
-  (void)name;
-#endif
-}
-
-static FrameNV12 sample_to_nv12_copy(GstSample* sample) {
-  if (!sample) throw std::runtime_error("sample_to_nv12_copy: null sample");
-
-  pipeline_internal::SampleHolder holder(gst_sample_ref(sample));
-  std::string map_err;
-  if (!pipeline_internal::map_video_frame_read(holder, map_err)) {
-    throw std::runtime_error("sample_to_nv12_copy: " + map_err);
-  }
-
-  const GstVideoFormat fmt = GST_VIDEO_INFO_FORMAT(&holder.vinfo);
-  if (fmt != GST_VIDEO_FORMAT_NV12) {
-    throw std::runtime_error("sample_to_nv12_copy: expected NV12 caps");
-  }
-
-  FrameNV12 out;
-  out.width = static_cast<int>(GST_VIDEO_INFO_WIDTH(&holder.vinfo));
-  out.height = static_cast<int>(GST_VIDEO_INFO_HEIGHT(&holder.vinfo));
-
-  GstBuffer* buffer = gst_sample_get_buffer(sample);
-  out.pts_ns = (buffer && GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer)))
-                   ? static_cast<int64_t>(GST_BUFFER_PTS(buffer))
-                   : -1;
-  out.dts_ns = (buffer && GST_CLOCK_TIME_IS_VALID(GST_BUFFER_DTS(buffer)))
-                   ? static_cast<int64_t>(GST_BUFFER_DTS(buffer))
-                   : -1;
-  out.duration_ns = (buffer && GST_CLOCK_TIME_IS_VALID(GST_BUFFER_DURATION(buffer)))
-                        ? static_cast<int64_t>(GST_BUFFER_DURATION(buffer))
-                        : -1;
-  out.keyframe = buffer ? !GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT) : false;
-
-  const int w = out.width;
-  const int h = out.height;
-  const size_t y_bytes = static_cast<size_t>(w) * static_cast<size_t>(h);
-  const size_t uv_bytes = static_cast<size_t>(w) * static_cast<size_t>(h / 2);
-
-  out.nv12.resize(y_bytes + uv_bytes);
-
-  uint8_t* y_dst = out.nv12.data();
-  for (int row = 0; row < h; ++row) {
-    const uint8_t* y_src =
-        static_cast<const uint8_t*>(GST_VIDEO_FRAME_PLANE_DATA(&holder.frame, 0)) +
-        static_cast<size_t>(row) * static_cast<size_t>(GST_VIDEO_FRAME_PLANE_STRIDE(&holder.frame, 0));
-    std::memcpy(y_dst + static_cast<size_t>(row) * static_cast<size_t>(w), y_src, static_cast<size_t>(w));
-  }
-
-  uint8_t* uv_dst = out.nv12.data() + y_bytes;
-  for (int row = 0; row < h / 2; ++row) {
-    const uint8_t* uv_src =
-        static_cast<const uint8_t*>(GST_VIDEO_FRAME_PLANE_DATA(&holder.frame, 1)) +
-        static_cast<size_t>(row) * static_cast<size_t>(GST_VIDEO_FRAME_PLANE_STRIDE(&holder.frame, 1));
-    std::memcpy(uv_dst + static_cast<size_t>(row) * static_cast<size_t>(w), uv_src, static_cast<size_t>(w));
-  }
-
-  return out;
-}
-
 // Best-effort naming contract enforcement; optional via env.
 static void enforce_names_contract(GstElement* pipeline,
                                    const BuildResult& br) {
@@ -1845,28 +1743,70 @@ static void set_state_or_throw(GstElement* pipeline,
     throw std::runtime_error(std::string(where) + ": pipeline is null");
   }
 
-  GstStateChangeReturn r = gst_element_set_state(pipeline, target);
-  if (r == GST_STATE_CHANGE_FAILURE) {
-    maybe_dump_dot(pipeline, std::string(where) + "_set_state_failure");
-    PipelineReport rep = diag ? diag->snapshot_basic() : PipelineReport{};
-    rep.repro_note =
-        std::string(where) + ": failed to set state.\n" +
-        boundary_summary_local(diag);
-    throw PipelineError(rep.repro_note, std::move(rep));
-  }
+  bool recovery_attempted = false;
+  while (true) {
+    GstStateChangeReturn r = gst_element_set_state(pipeline, target);
+    if (r == GST_STATE_CHANGE_FAILURE) {
+      maybe_dump_dot(pipeline, std::string(where) + "_set_state_failure");
+      if (env_bool("SIMA_DISPATCHER_TRACE", false)) {
+        std::fprintf(stderr, "[TRACE] %s: set_state FAILURE\n", where);
+      }
+      PipelineReport rep = diag ? diag->snapshot_basic() : PipelineReport{};
+      rep.repro_note =
+          std::string(where) + ": failed to set state.\n" +
+          boundary_summary_local(diag);
+      throw PipelineError(rep.repro_note, std::move(rep));
+    }
 
-  GstState cur = GST_STATE_VOID_PENDING;
-  GstState pend = GST_STATE_VOID_PENDING;
-  gst_element_get_state(pipeline, &cur, &pend, 2 * GST_SECOND);
+    GstState cur = GST_STATE_VOID_PENDING;
+    GstState pend = GST_STATE_VOID_PENDING;
+    gst_element_get_state(pipeline, &cur, &pend, 2 * GST_SECOND);
 
-  drain_bus_into_diag(pipeline, diag);
-  throw_if_bus_error_local(pipeline, diag, where);
+    drain_bus_into_diag(pipeline, diag);
+    try {
+      throw_if_bus_error_local(pipeline, diag, where);
+    } catch (const PipelineError& e) {
+      if (env_bool("SIMA_DISPATCHER_TRACE", false)) {
+        std::fprintf(stderr, "[TRACE] %s: PipelineError: %s\n", where, e.what());
+      }
+      PipelineReport rep = e.report();
+      const bool allow_recover =
+          pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+      if (pipeline_internal::is_dispatcher_unavailable(rep) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        continue;
+      }
+      throw;
+    } catch (const std::exception& e) {
+      if (env_bool("SIMA_DISPATCHER_TRACE", false)) {
+        std::fprintf(stderr, "[TRACE] %s: exception: %s\n", where, e.what());
+      }
+      const std::string msg = e.what();
+      const bool allow_recover =
+          pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+      if (pipeline_internal::match_dispatcher_unavailable(msg) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        PipelineReport rep;
+        rep.repro_note = msg;
+        rep.error_code = pipeline_internal::kDispatcherUnavailableError;
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        continue;
+      }
+      throw;
+    }
 
-  if (env_bool("SIMA_INPUTSTREAM_DEBUG", false)) {
-    std::fprintf(stderr, "[DBG] %s state cur=%s pending=%s\n",
-                 where,
-                 gst_element_state_get_name(cur),
-                 gst_element_state_get_name(pend));
+    if (env_bool("SIMA_INPUTSTREAM_DEBUG", false)) {
+      std::fprintf(stderr, "[DBG] %s state cur=%s pending=%s\n",
+                   where,
+                   gst_element_state_get_name(cur),
+                   gst_element_state_get_name(pend));
+    }
+    return;
   }
 }
 
@@ -2022,6 +1962,7 @@ PipelineSession::~PipelineSession() {
     built_->pipeline = nullptr;
   }
   built_.reset();
+  run_cache_.reset();
 }
 
 PipelineSession::PipelineSession(PipelineSession&& other) noexcept {
@@ -2033,9 +1974,8 @@ PipelineSession::PipelineSession(PipelineSession&& other) noexcept {
   tensor_cb_ = std::move(other.tensor_cb_);
   nodes_version_.store(other.nodes_version_.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
-  cached_input_version_ = other.cached_input_version_;
-  cached_input_ = std::move(other.cached_input_);
   built_ = std::move(other.built_);
+  run_cache_ = std::move(other.run_cache_);
   built_version_ = other.built_version_;
 }
 
@@ -2049,9 +1989,8 @@ PipelineSession& PipelineSession::operator=(PipelineSession&& other) noexcept {
     tensor_cb_ = std::move(other.tensor_cb_);
     nodes_version_.store(other.nodes_version_.load(std::memory_order_relaxed),
                          std::memory_order_relaxed);
-    cached_input_version_ = other.cached_input_version_;
-    cached_input_ = std::move(other.cached_input_);
     built_ = std::move(other.built_);
+    run_cache_ = std::move(other.run_cache_);
     built_version_ = other.built_version_;
   }
   return *this;
@@ -2060,7 +1999,6 @@ PipelineSession& PipelineSession::operator=(PipelineSession&& other) noexcept {
 PipelineSession& PipelineSession::add(std::shared_ptr<Node> node) {
   nodes_.push_back(std::move(node));
   nodes_version_.fetch_add(1, std::memory_order_relaxed);
-  cached_input_.reset();
   if (built_ && built_->sink) {
     gst_object_unref(built_->sink);
   }
@@ -2068,6 +2006,7 @@ PipelineSession& PipelineSession::add(std::shared_ptr<Node> node) {
     stop_and_unref(built_->pipeline);
   }
   built_.reset();
+  run_cache_.reset();
   return *this;
 }
 
@@ -2075,7 +2014,6 @@ PipelineSession& PipelineSession::add(const NodeGroup& group) {
   const auto& gnodes = group.nodes();
   nodes_.insert(nodes_.end(), gnodes.begin(), gnodes.end());
   nodes_version_.fetch_add(1, std::memory_order_relaxed);
-  cached_input_.reset();
   if (built_ && built_->sink) {
     gst_object_unref(built_->sink);
   }
@@ -2083,6 +2021,7 @@ PipelineSession& PipelineSession::add(const NodeGroup& group) {
     stop_and_unref(built_->pipeline);
   }
   built_.reset();
+  run_cache_.reset();
   return *this;
 }
 
@@ -2093,7 +2032,6 @@ PipelineSession& PipelineSession::add(NodeGroup&& group) {
                 std::make_move_iterator(gnodes.end()));
   gnodes.clear();
   nodes_version_.fetch_add(1, std::memory_order_relaxed);
-  cached_input_.reset();
   if (built_ && built_->sink) {
     gst_object_unref(built_->sink);
   }
@@ -2101,6 +2039,7 @@ PipelineSession& PipelineSession::add(NodeGroup&& group) {
     stop_and_unref(built_->pipeline);
   }
   built_.reset();
+  run_cache_.reset();
   return *this;
 }
 
@@ -2114,7 +2053,6 @@ PipelineSession& PipelineSession::gst(std::string fragment, InputRole role) {
 
 void PipelineSession::set_guard(std::shared_ptr<void> guard) {
   guard_ = std::move(guard);
-  cached_input_.reset();
   if (built_ && built_->sink) {
     gst_object_unref(built_->sink);
   }
@@ -2122,6 +2060,7 @@ void PipelineSession::set_guard(std::shared_ptr<void> guard) {
     stop_and_unref(built_->pipeline);
   }
   built_.reset();
+  run_cache_.reset();
 }
 
 void PipelineSession::set_frame_callback(FrameCallback cb) {
@@ -2130,15 +2069,6 @@ void PipelineSession::set_frame_callback(FrameCallback cb) {
 
 void PipelineSession::set_tensor_callback(TensorCallback cb) {
   tensor_cb_ = std::move(cb);
-}
-
-InputStreamStats PipelineSession::last_input_stats() const {
-  return last_input_stats_;
-}
-
-std::string PipelineSession::last_input_diagnostics() const {
-  if (!cached_input_) return {};
-  return cached_input_->diagnostics_summary();
 }
 
 void PipelineSession::run() {
@@ -2151,76 +2081,93 @@ void PipelineSession::run() {
   require_element("appsink", "PipelineSession::run");
   require_element("identity", "PipelineSession::run");
 
-  build();
+  bool recovery_attempted = false;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    try {
+      build_cached_source();
 
-  auto guard = guard_;
-  GstElement* pipeline = nullptr;
-  GstElement* sink = nullptr;
-  std::shared_ptr<DiagCtx> diag;
-  const uint64_t version = nodes_version_.load(std::memory_order_relaxed);
+      auto guard = guard_;
+      GstElement* pipeline = nullptr;
+      GstElement* sink = nullptr;
+      std::shared_ptr<DiagCtx> diag;
+      const uint64_t version = nodes_version_.load(std::memory_order_relaxed);
 
-  if (built_ && built_->pipeline && built_->sink && built_version_ == version) {
-    pipeline = built_->pipeline;
-    sink = built_->sink;
-    diag = std::static_pointer_cast<DiagCtx>(built_->diag);
-    built_.reset();
-  } else {
-    throw std::runtime_error("PipelineSession::run: build() did not create a pipeline");
-  }
+      if (built_ && built_->pipeline && built_->sink && built_version_ == version) {
+        pipeline = built_->pipeline;
+        sink = built_->sink;
+        diag = std::static_pointer_cast<DiagCtx>(built_->diag);
+        built_.reset();
+      } else {
+        throw std::runtime_error("PipelineSession::run: build() did not create a pipeline");
+      }
 
-  try {
-    set_state_or_throw(pipeline, GST_STATE_PLAYING, "PipelineSession::run", diag);
-  } catch (...) {
-    gst_object_unref(sink);
-    stop_and_unref(pipeline);
-    throw;
-  }
+      try {
+        set_state_or_throw(pipeline, GST_STATE_PLAYING, "PipelineSession::run", diag);
+      } catch (...) {
+        gst_object_unref(sink);
+        stop_and_unref(pipeline);
+        throw;
+      }
 
-  const int timeout_ms = std::max(-1, opt_.callback_timeout_ms);
+      const int timeout_ms = std::max(-1, opt_.callback_timeout_ms);
 
-  if (opt_.output_kind == PipelineOutputKind::Tensor) {
-    if (!tensor_cb_) {
-      gst_object_unref(sink);
-      stop_and_unref(pipeline);
-      throw std::runtime_error("PipelineSession::run: tensor callback not set");
-    }
+      if (opt_.output_kind == PipelineOutputKind::Tensor) {
+        if (!tensor_cb_) {
+          gst_object_unref(sink);
+          stop_and_unref(pipeline);
+          throw std::runtime_error("PipelineSession::run: tensor callback not set");
+        }
 
-    TensorStream ts(pipeline, sink);
-    ts.set_debug_pipeline(last_pipeline_);
-    ts.set_diag(diag);
-    ts.set_guard(std::move(guard));
+        TensorStream ts(pipeline, sink);
+        ts.set_debug_pipeline(last_pipeline_);
+        ts.set_diag(diag);
+        ts.set_guard(std::move(guard));
 
-    while (true) {
-      auto frame = ts.next(timeout_ms);
-      if (!frame.has_value()) {
-        if (gst_app_sink_is_eos(GST_APP_SINK(sink))) break;
+        while (true) {
+          auto tensor = ts.next(timeout_ms);
+          if (!tensor.has_value()) {
+            if (gst_app_sink_is_eos(GST_APP_SINK(sink))) break;
+            continue;
+          }
+          if (!tensor_cb_(*tensor)) break;
+        }
+        return;
+      }
+
+      if (!frame_cb_) {
+        gst_object_unref(sink);
+        stop_and_unref(pipeline);
+        throw std::runtime_error("PipelineSession::run: frame callback not set");
+      }
+
+      TensorStream ts(pipeline, sink);
+      ts.set_debug_pipeline(last_pipeline_);
+      ts.set_diag(diag);
+      ts.set_guard(std::move(guard));
+
+      while (true) {
+        auto tensor = ts.next(timeout_ms);
+        if (!tensor.has_value()) {
+          if (gst_app_sink_is_eos(GST_APP_SINK(sink))) break;
+          continue;
+        }
+        if (!frame_cb_(*tensor)) break;
+      }
+      return;
+    } catch (const PipelineError& e) {
+      PipelineReport rep = e.report();
+      if (pipeline_internal::is_dispatcher_unavailable(rep) && !recovery_attempted) {
+        recovery_attempted = true;
+        if (opt_.on_dispatcher_error) opt_.on_dispatcher_error(rep);
+        const bool allow_recover =
+            opt_.auto_recover_dispatcher &&
+            pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
         continue;
       }
-      if (!tensor_cb_(*frame)) break;
+      throw PipelineError(rep.repro_note, std::move(rep));
     }
-    return;
   }
-
-  if (!frame_cb_) {
-    gst_object_unref(sink);
-    stop_and_unref(pipeline);
-    throw std::runtime_error("PipelineSession::run: frame callback not set");
-  }
-
-  FrameStream fs(pipeline, sink);
-  fs.set_debug_pipeline(last_pipeline_);
-  fs.set_diag(diag);
-  fs.set_guard(std::move(guard));
-
-  while (true) {
-    auto frame = fs.next(timeout_ms);
-    if (!frame.has_value()) {
-      if (gst_app_sink_is_eos(GST_APP_SINK(sink))) break;
-      continue;
-    }
-    if (!frame_cb_(*frame)) break;
-  }
-  return;
 }
 
 TensorStream PipelineSession::run_tensor() {
@@ -2236,8 +2183,11 @@ TensorStream PipelineSession::run_tensor() {
   const bool insert_boundaries =
       should_insert_boundaries_for_mode("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
 
-  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink", false);
   last_pipeline_ = br.pipeline_string;
+  enforce_mla_pipeline_guard("PipelineSession::build", last_pipeline_, this);
+  enforce_mla_pipeline_guard("PipelineSession::run_packet_stream", last_pipeline_, this);
+  enforce_mla_pipeline_guard("PipelineSession::run_tensor", last_pipeline_, this);
 
   auto guard = guard_;
 
@@ -2297,7 +2247,7 @@ TapStream PipelineSession::run_packet_stream() {
   const bool insert_boundaries =
       should_insert_boundaries_for_mode("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
 
-  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink", false);
   last_pipeline_ = br.pipeline_string;
 
   auto guard = guard_;
@@ -2345,7 +2295,118 @@ TapStream PipelineSession::run_packet_stream() {
   return ts;
 }
 
-void PipelineSession::build() {
+PipelineRun PipelineSession::build(const PipelineRunOptions& opt) {
+  gst_init_once();
+
+  bool recovery_attempted = false;
+  while (true) {
+    try {
+      enforce_source_run_mode(nodes_, "PipelineSession::build");
+      enforce_sink_last_if_present(nodes_, "PipelineSession::build");
+
+      const bool has_sink = has_output_appsink(nodes_);
+      if (has_sink) {
+        require_element("appsink", "PipelineSession::build");
+        require_element("identity", "PipelineSession::build");
+      }
+
+      PipelineRunOptions merged_opt = apply_run_defaults(opt, opt_);
+      InputStreamOptions stream_opt = make_stream_options(merged_opt);
+      const bool insert_queue2 = opt_.enable_async_queue2;
+
+      const bool insert_boundaries =
+          should_insert_boundaries_for_mode("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
+
+      BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink", insert_queue2);
+      last_pipeline_ = br.pipeline_string;
+
+      GError* err = nullptr;
+      GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
+      if (!pipeline) {
+        std::string msg = err ? err->message : "unknown";
+        if (err) g_error_free(err);
+        throw std::runtime_error(
+            "PipelineSession::build: gst_parse_launch failed: " + msg +
+            "\nPipeline:\n" + last_pipeline_);
+      }
+      if (err) g_error_free(err);
+
+      if (env_bool("SIMA_GST_ENFORCE_NAMES", false)) {
+        enforce_names_contract(pipeline, br);
+      }
+
+      attach_boundary_probes(pipeline, br.diag);
+      attach_stage_timing_probes(pipeline, br.diag);
+
+      GstElement* sink = nullptr;
+      if (has_sink) {
+        sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
+        if (!sink) {
+          maybe_dump_dot(pipeline, "build_missing_mysink");
+          stop_and_unref(pipeline);
+          throw std::runtime_error(
+              "PipelineSession::build: appsink 'mysink' not found.\n"
+              "Fix: add OutputAppSink() as the last node.\nPipeline:\n" +
+              last_pipeline_);
+        }
+        configure_appsink_for_input_stream(sink, stream_opt);
+      }
+
+      try {
+        set_state_or_throw(pipeline, GST_STATE_PLAYING, "PipelineSession::build", br.diag);
+      } catch (...) {
+        if (sink) gst_object_unref(sink);
+        stop_and_unref(pipeline);
+        throw;
+      }
+
+      InputCapsConfig cfg{};
+      InputAppSrcOptions src_opt{};
+      InputStream stream = InputStream::create(pipeline,
+                                               nullptr,
+                                               sink,
+                                               cfg,
+                                               src_opt,
+                                               stream_opt,
+                                               br.diag,
+                                               guard_);
+      return PipelineRun::create(std::move(stream), merged_opt, stream_opt);
+    } catch (const PipelineError& e) {
+      PipelineReport rep = e.report();
+      const bool allow_recover =
+          opt_.auto_recover_dispatcher &&
+          pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+      if (pipeline_internal::is_dispatcher_unavailable(rep) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        if (opt_.on_dispatcher_error) opt_.on_dispatcher_error(rep);
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        continue;
+      }
+      throw;
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      const bool allow_recover =
+          opt_.auto_recover_dispatcher &&
+          pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+      if (pipeline_internal::match_dispatcher_unavailable(msg) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        PipelineReport rep;
+        rep.repro_note = msg;
+        rep.error_code = pipeline_internal::kDispatcherUnavailableError;
+        if (opt_.on_dispatcher_error) opt_.on_dispatcher_error(rep);
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        continue;
+      }
+      throw;
+    }
+  }
+}
+
+void PipelineSession::build_cached_source() {
   gst_init_once();
 
   enforce_source_run_mode(nodes_, "PipelineSession::build");
@@ -2370,7 +2431,7 @@ void PipelineSession::build() {
   const bool insert_boundaries =
       should_insert_boundaries_for_mode("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
 
-  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink", false);
   last_pipeline_ = br.pipeline_string;
 
   GError* err = nullptr;
@@ -2416,41 +2477,184 @@ void PipelineSession::build() {
   built_version_ = version;
 }
 
-void PipelineSession::build(const cv::Mat& input, const RunInputOptions& opt) {
+PipelineRun PipelineSession::build(const cv::Mat& input, const PipelineRunOptions& opt) {
+  return build(input, PipelineRunMode::Async, opt);
+}
+
+PipelineRun PipelineSession::build(const cv::Mat& input, PipelineRunMode mode) {
+  if (mode == PipelineRunMode::Sync) {
+    PipelineRunOptions opt = sync_run_defaults();
+    opt.preflight_run = false;
+    return build(input, mode, opt);
+  }
+  PipelineRunOptions opt;
+  return build(input, mode, opt);
+}
+
+PipelineRun PipelineSession::build(const cv::Mat& input,
+                                   PipelineRunMode mode,
+                                   const PipelineRunOptions& opt) {
   gst_init_once();
 
-  enforce_sink_last(nodes_);
-  enforce_push_run_mode(nodes_, "PipelineSession::build(input)");
-  require_input_appsrc(nodes_, "PipelineSession::build(input)", nullptr);
+  bool recovery_attempted = false;
+  while (true) {
+    PipelineRunOptions merged_opt = apply_run_defaults(opt, opt_);
+    const bool allow_recover =
+        merged_opt.auto_recover_dispatcher &&
+        pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+    try {
+      enforce_sink_last_if_present(nodes_, "PipelineSession::build(input)");
+      enforce_push_run_mode(nodes_, "PipelineSession::build(input)");
+      const InputAppSrc* src_node = nullptr;
+      require_input_appsrc(nodes_, "PipelineSession::build(input)", &src_node);
 
-  const bool timing_enabled = env_bool("SIMA_RUN_INPUT_TIMINGS", false);
-  const uint64_t version = nodes_version_.load(std::memory_order_relaxed);
-  const bool opts_match =
-      cached_input_opts_valid_ &&
-      cached_input_opts_.copy_output == opt.copy_output &&
-      cached_input_opts_.reuse_input_buffer == opt.reuse_input_buffer &&
-      cached_input_opts_.strict == opt.strict &&
-      cached_input_timings_ == timing_enabled;
+      InputStreamOptions stream_opt = make_stream_options(merged_opt);
+      const bool insert_queue2 =
+          (mode == PipelineRunMode::Async) ? opt_.enable_async_queue2 : false;
 
-  if (cached_input_ && cached_input_version_ == version && opts_match) {
-    return;
+      InputStream stream = run_input_stream_internal(
+          nodes_,
+          guard_,
+          this,
+          last_pipeline_,
+          input,
+          stream_opt,
+          insert_queue2,
+          mode == PipelineRunMode::Sync);
+      warn_run_input_num_buffers(last_pipeline_);
+      PipelineRun runner = PipelineRun::create(std::move(stream), merged_opt, stream_opt);
+      if (mode == PipelineRunMode::Sync) {
+        RunInputOptions run_opt;
+        run_opt.copy_output = merged_opt.copy_output;
+        run_opt.reuse_input_buffer = merged_opt.reuse_input_buffer;
+        run_opt.strict = !merged_opt.allow_mismatched_input;
+
+        auto cache = std::make_unique<RunCache>();
+        cache->runner = PipelineRun(runner.state_);
+        cache->caps = infer_input_caps(src_node->options(), input);
+        cache->opt = run_opt;
+        cache->nodes_version = nodes_version_.load(std::memory_order_relaxed);
+        cache->input_kind = RunInputKind::Mat;
+        run_cache_ = std::move(cache);
+      }
+      return runner;
+    } catch (const PipelineError& e) {
+      PipelineReport rep = e.report();
+      if (pipeline_internal::is_dispatcher_unavailable(rep) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        if (opt_.on_dispatcher_error) opt_.on_dispatcher_error(rep);
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        continue;
+      }
+      throw;
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      if (pipeline_internal::match_dispatcher_unavailable(msg) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        PipelineReport rep;
+        rep.repro_note = msg;
+        rep.error_code = pipeline_internal::kDispatcherUnavailableError;
+        if (opt_.on_dispatcher_error) opt_.on_dispatcher_error(rep);
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        continue;
+      }
+      throw;
+    }
   }
+}
 
-  InputStreamOptions stream_opt;
-  stream_opt.appsink_sync = false;
-  stream_opt.appsink_drop = false;
-  stream_opt.appsink_max_buffers = 1;
-  stream_opt.allow_mismatched_input = !opt.strict;
-  stream_opt.copy_output = opt.copy_output;
-  stream_opt.reuse_input_buffer = opt.reuse_input_buffer;
-  stream_opt.enable_timings = timing_enabled;
+PipelineRun PipelineSession::build(const NeatTensor& input, const PipelineRunOptions& opt) {
+  return build(input, PipelineRunMode::Async, opt);
+}
 
-  cached_input_ = std::make_unique<InputStream>(run_input_stream(input, stream_opt));
-  cached_input_version_ = version;
-  cached_input_opts_ = opt;
-  cached_input_opts_valid_ = true;
-  cached_input_timings_ = timing_enabled;
-  warn_run_input_num_buffers(last_pipeline_);
+PipelineRun PipelineSession::build(const NeatTensor& input, PipelineRunMode mode) {
+  if (mode == PipelineRunMode::Sync) {
+    PipelineRunOptions opt = sync_run_defaults();
+    opt.preflight_run = false;
+    return build(input, mode, opt);
+  }
+  PipelineRunOptions opt;
+  return build(input, mode, opt);
+}
+
+PipelineRun PipelineSession::build(const NeatTensor& input,
+                                   PipelineRunMode mode,
+                                   const PipelineRunOptions& opt) {
+  gst_init_once();
+
+  bool recovery_attempted = false;
+  while (true) {
+    PipelineRunOptions merged_opt = apply_run_defaults(opt, opt_);
+    const bool allow_recover =
+        merged_opt.auto_recover_dispatcher &&
+        pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+    try {
+      enforce_sink_last_if_present(nodes_, "PipelineSession::build(input)");
+      enforce_push_run_mode(nodes_, "PipelineSession::build(input)");
+      const InputAppSrc* src_node = nullptr;
+      require_input_appsrc(nodes_, "PipelineSession::build(input)", &src_node);
+
+      InputStreamOptions stream_opt = make_stream_options(merged_opt);
+      const bool insert_queue2 =
+          (mode == PipelineRunMode::Async) ? opt_.enable_async_queue2 : false;
+
+      InputStream stream = run_input_stream_internal(
+          nodes_,
+          guard_,
+          this,
+          last_pipeline_,
+          input,
+          stream_opt,
+          insert_queue2,
+          mode == PipelineRunMode::Sync);
+      warn_run_input_num_buffers(last_pipeline_);
+      PipelineRun runner = PipelineRun::create(std::move(stream), merged_opt, stream_opt);
+      if (mode == PipelineRunMode::Sync) {
+        RunInputOptions run_opt;
+        run_opt.copy_output = merged_opt.copy_output;
+        run_opt.reuse_input_buffer = merged_opt.reuse_input_buffer;
+        run_opt.strict = !merged_opt.allow_mismatched_input;
+
+        auto cache = std::make_unique<RunCache>();
+        cache->runner = PipelineRun(runner.state_);
+        cache->caps = infer_input_caps(src_node->options(), input);
+        cache->opt = run_opt;
+        cache->nodes_version = nodes_version_.load(std::memory_order_relaxed);
+        cache->input_kind = RunInputKind::NeatTensor;
+        run_cache_ = std::move(cache);
+      }
+      return runner;
+    } catch (const PipelineError& e) {
+      PipelineReport rep = e.report();
+      if (pipeline_internal::is_dispatcher_unavailable(rep) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        if (opt_.on_dispatcher_error) opt_.on_dispatcher_error(rep);
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        continue;
+      }
+      throw;
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      if (pipeline_internal::match_dispatcher_unavailable(msg) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        PipelineReport rep;
+        rep.repro_note = msg;
+        rep.error_code = pipeline_internal::kDispatcherUnavailableError;
+        if (opt_.on_dispatcher_error) opt_.on_dispatcher_error(rep);
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        continue;
+      }
+      throw;
+    }
+  }
 }
 
 RunInputResult PipelineSession::run(const cv::Mat& input) {
@@ -2464,524 +2668,209 @@ RunInputResult PipelineSession::run(const cv::Mat& input, const RunInputOptions&
   enforce_sink_last(nodes_);
   enforce_push_run_mode(nodes_, "PipelineSession::run(input)");
 
-  require_input_appsrc(nodes_, "PipelineSession::run(input)", nullptr);
-
-  build(input, opt);
+  const InputAppSrc* src_node = nullptr;
+  require_input_appsrc(nodes_, "PipelineSession::run(input)", &src_node);
 
   const int timeout_ms =
       std::max(10, std::atoi(env_str("SIMA_GST_RUN_INPUT_TIMEOUT_MS", "10000").c_str()));
+  const InputCapsConfig cfg = infer_input_caps(src_node->options(), input);
+  const uint64_t version = nodes_version_.load(std::memory_order_relaxed);
+  bool reuse_cache =
+      run_cache_ &&
+      run_cache_->input_kind == RunInputKind::Mat &&
+      run_cache_->nodes_version == version &&
+      run_input_options_equal(run_cache_->opt, opt) &&
+      caps_equal(run_cache_->caps, cfg);
+  PipelineRunOptions run_opt = sync_run_defaults();
+  run_opt.copy_output = opt.copy_output;
+  run_opt.allow_mismatched_input = !opt.strict;
+  run_opt.reuse_input_buffer = opt.reuse_input_buffer;
+  run_opt.timeout_ms = timeout_ms;
+  run_opt.enable_timings = env_bool("SIMA_RUN_INPUT_TIMINGS", false);
+  run_opt.auto_recover_dispatcher = opt_.auto_recover_dispatcher;
+  run_opt.on_dispatcher_error = opt_.on_dispatcher_error;
 
-  try {
-    RunInputResult out = cached_input_->push_and_pull(input, timeout_ms);
-    last_input_stats_ = cached_input_->stats();
-    return out;
-  } catch (...) {
-    cached_input_.reset();
-    throw;
-  }
-}
-
-struct InputStream::State {
-  GstElement* pipeline = nullptr;
-  GstElement* appsrc = nullptr;
-  GstElement* appsink = nullptr;
-  InputCapsConfig cfg;
-  InputAppSrcOptions src_opt;
-  InputStreamOptions opt;
-  InputBufferPoolGuard pool_guard;
-  GstBuffer* reusable_buffer = nullptr;
-  size_t reusable_bytes = 0;
-  std::shared_ptr<DiagCtx> diag;
-  std::shared_ptr<void> guard;
-  std::thread worker;
-  std::atomic<bool> running{false};
-  std::atomic<bool> stop_requested{false};
-  std::function<void(RunInputResult)> callback;
-  mutable std::mutex error_mu;
-  std::string error;
-  bool timing_enabled = false;
-  std::atomic<std::uint64_t> push_count{0};
-  std::atomic<std::uint64_t> push_failures{0};
-  std::atomic<std::uint64_t> pull_count{0};
-  std::atomic<std::uint64_t> poll_count{0};
-  std::atomic<std::uint64_t> alloc_ns{0};
-  std::atomic<std::uint64_t> map_ns{0};
-  std::atomic<std::uint64_t> copy_ns{0};
-  std::atomic<std::uint64_t> push_ns{0};
-  std::atomic<std::uint64_t> pull_wait_ns{0};
-  std::atomic<std::uint64_t> decode_ns{0};
-  std::atomic<std::int64_t> last_push_ns{0};
-  std::atomic<bool> eos_sent{false};
-};
-
-static RunInputResult output_from_sample_stream(GstSample* sample,
-                                                const char* where,
-                                                bool copy_output);
-
-InputStream::InputStream(std::shared_ptr<State> state) : state_(std::move(state)) {}
-
-InputStream::InputStream(InputStream&& other) noexcept : state_(std::move(other.state_)) {}
-
-InputStream& InputStream::operator=(InputStream&& other) noexcept {
-  if (this != &other) {
-    close();
-    state_ = std::move(other.state_);
-  }
-  return *this;
-}
-
-InputStream::~InputStream() {
-  close();
-}
-
-InputStream::operator bool() const noexcept {
-  return state_ && state_->pipeline && state_->appsrc && state_->appsink;
-}
-
-bool InputStream::running() const {
-  return state_ && state_->running.load();
-}
-
-std::string InputStream::last_error() const {
-  if (!state_) return {};
-  std::lock_guard<std::mutex> lock(state_->error_mu);
-  return state_->error;
-}
-
-InputStreamStats InputStream::stats() const {
-  InputStreamStats out;
-  if (!state_) return out;
-
-  if (!state_->timing_enabled) return out;
-  out.push_count = state_->push_count.load();
-  out.push_failures = state_->push_failures.load();
-  out.pull_count = state_->pull_count.load();
-  out.poll_count = state_->poll_count.load();
-
-  const auto avg_us = [](std::uint64_t total_ns, std::uint64_t count) -> double {
-    if (count == 0) return 0.0;
-    return static_cast<double>(total_ns) / static_cast<double>(count) / 1000.0;
-  };
-
-  out.avg_alloc_us = avg_us(state_->alloc_ns.load(), out.push_count);
-  out.avg_map_us = avg_us(state_->map_ns.load(), out.push_count);
-  out.avg_copy_us = avg_us(state_->copy_ns.load(), out.push_count);
-  out.avg_push_us = avg_us(state_->push_ns.load(), out.push_count);
-  out.avg_pull_wait_us = avg_us(state_->pull_wait_ns.load(), out.pull_count);
-  out.avg_decode_us = avg_us(state_->decode_ns.load(), out.pull_count);
-  return out;
-}
-
-std::string InputStream::diagnostics_summary() const {
-  if (!state_ || !state_->diag) return {};
-  std::ostringstream oss;
-  if (!state_->diag->pipeline_string.empty()) {
-    oss << "Pipeline:\n" << state_->diag->pipeline_string << "\n";
-  }
-  const std::string boundary = pipeline_internal::boundary_summary(state_->diag);
-  if (!boundary.empty()) oss << boundary;
-  const std::string stages = pipeline_internal::stage_timing_summary(state_->diag);
-  if (!stages.empty()) oss << stages;
-  if (env_bool("SIMA_INPUTSTREAM_DEBUG", false)) {
-    PipelineReport rep = state_->diag->snapshot_basic();
-    if (!rep.bus.empty()) {
-      oss << "Bus:\n";
-      const size_t max_lines = std::min<size_t>(rep.bus.size(), 10);
-      for (size_t i = 0; i < max_lines; ++i) {
-        const auto& msg = rep.bus[i];
-        oss << "  - [" << msg.type << "] " << msg.src << ": " << msg.detail << "\n";
-      }
-    }
-  }
-  return oss.str();
-}
-
-void InputStream::start(std::function<void(RunInputResult)> on_output) {
-  if (!state_ || !state_->pipeline) {
-    throw std::runtime_error("InputStream::start: stream is closed");
-  }
-  if (state_->running.load()) {
-    throw std::runtime_error("InputStream::start: stream already running");
-  }
-  if (state_->opt.reuse_input_buffer) {
-    std::fprintf(stderr,
-                 "[WARN] InputStream::start: reuse_input_buffer is unsafe for async streams; "
-                 "disabling to avoid data races.\n");
-    state_->opt.reuse_input_buffer = false;
-  }
-  state_->callback = std::move(on_output);
-  state_->stop_requested.store(false);
-  state_->running.store(true);
-
-  auto st = state_;
-  st->worker = std::thread([st]() {
-    const int poll_ms = std::max(10,
-        std::atoi(env_str("SIMA_INPUTSTREAM_POLL_MS", "50").c_str()));
-    const int timeout_ms = st->opt.timeout_ms;
-    const bool timings = st->timing_enabled;
-    auto cb = st->callback;
-    std::int64_t last_output_ns = 0;
+  bool recovery_attempted = false;
+  while (true) {
     try {
-      while (!st->stop_requested.load()) {
-        std::chrono::steady_clock::time_point t_wait_start{};
-        if (timings) t_wait_start = std::chrono::steady_clock::now();
-        auto sample_opt = pipeline_internal::try_pull_sample_sliced(
-            st->pipeline, st->appsink, poll_ms, st->diag, "InputStream::start");
-        std::chrono::steady_clock::time_point t_wait_end{};
-        if (timings) t_wait_end = std::chrono::steady_clock::now();
-        if (timings) {
-          st->poll_count.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (!sample_opt.has_value()) {
-          if (timeout_ms > 0) {
-            const std::int64_t last_push_ns =
-                st->last_push_ns.load(std::memory_order_relaxed);
-            if (last_push_ns > 0) {
-              const auto now_tp = std::chrono::steady_clock::now();
-              const std::int64_t now_ns = static_cast<std::int64_t>(
-                  std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      now_tp.time_since_epoch()).count());
-              const std::int64_t last_activity_ns =
-                  (last_output_ns > last_push_ns) ? last_output_ns : last_push_ns;
-              const std::int64_t timeout_ns =
-                  static_cast<std::int64_t>(timeout_ms) * 1000000;
-              if (now_ns - last_activity_ns > timeout_ns) {
-                std::lock_guard<std::mutex> lock(st->error_mu);
-                st->error = "InputStream::start: timeout waiting for output";
-                st->stop_requested.store(true);
-                break;
-              }
-            }
-          }
-          continue;
-        }
-        if (timings) {
-          st->pull_wait_ns.fetch_add(
-              static_cast<std::uint64_t>(
-                  std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      t_wait_end - t_wait_start).count()),
-              std::memory_order_relaxed);
-        }
-        GstSample* sample = sample_opt.value();
-        std::chrono::steady_clock::time_point t_decode_start{};
-        if (timings) t_decode_start = std::chrono::steady_clock::now();
-        RunInputResult out =
-            output_from_sample_stream(sample, "InputStream::start", st->opt.copy_output);
-        std::chrono::steady_clock::time_point t_decode_end{};
-        if (timings) t_decode_end = std::chrono::steady_clock::now();
-        gst_sample_unref(sample);
-        if (timings) {
-          st->decode_ns.fetch_add(
-              static_cast<std::uint64_t>(
-                  std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      t_decode_end - t_decode_start).count()),
-              std::memory_order_relaxed);
-          st->pull_count.fetch_add(1, std::memory_order_relaxed);
-          last_output_ns = static_cast<std::int64_t>(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  t_decode_end.time_since_epoch()).count());
-        } else {
-          const auto now_tp = std::chrono::steady_clock::now();
-          last_output_ns = static_cast<std::int64_t>(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  now_tp.time_since_epoch()).count());
-        }
-        if (cb) cb(std::move(out));
+      if (!reuse_cache) {
+        PipelineRun runner = build(input, PipelineRunMode::Sync, run_opt);
+        auto cache = std::make_unique<RunCache>();
+        cache->runner = std::move(runner);
+        cache->caps = cfg;
+        cache->opt = opt;
+        cache->nodes_version = version;
+        cache->input_kind = RunInputKind::Mat;
+        run_cache_ = std::move(cache);
       }
+      return run_cache_->runner.push_and_pull(input, timeout_ms);
+    } catch (const PipelineError& e) {
+      PipelineReport rep = e.report();
+      const bool allow_recover =
+          opt_.auto_recover_dispatcher &&
+          pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+      if (pipeline_internal::is_dispatcher_unavailable(rep) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        run_cache_.reset();
+        reuse_cache = false;
+        continue;
+      }
+      throw PipelineError(rep.repro_note, std::move(rep));
     } catch (const std::exception& e) {
-      std::lock_guard<std::mutex> lock(st->error_mu);
-      st->error = e.what();
-    }
-    st->running.store(false);
-  });
-}
-
-void InputStream::stop() {
-  if (!state_) return;
-  state_->stop_requested.store(true);
-  if (state_->worker.joinable()) {
-    state_->worker.join();
-  }
-  state_->running.store(false);
-}
-
-void InputStream::close() {
-  if (!state_) return;
-  stop();
-  if (state_->reusable_buffer) {
-    gst_buffer_unref(state_->reusable_buffer);
-    state_->reusable_buffer = nullptr;
-    state_->reusable_bytes = 0;
-  }
-  if (state_->appsrc) {
-    gst_object_unref(state_->appsrc);
-    state_->appsrc = nullptr;
-  }
-  if (state_->appsink) {
-    gst_object_unref(state_->appsink);
-    state_->appsink = nullptr;
-  }
-  if (state_->pipeline) {
-    stop_and_unref(state_->pipeline);
-  }
-  state_.reset();
-}
-
-void InputStream::push(const cv::Mat& input) {
-  if (!try_push(input)) {
-    throw std::runtime_error("InputStream::push: appsrc push failed");
-  }
-}
-
-bool InputStream::try_push(const cv::Mat& input) {
-  if (!state_ || !state_->pipeline) {
-    throw std::runtime_error("InputStream::try_push: stream is closed");
-  }
-  if (!state_->opt.allow_mismatched_input) {
-    validate_input_matches_caps(state_->cfg, state_->src_opt, input, "InputStream::try_push");
-  } else if (input.empty()) {
-    throw std::invalid_argument("InputStream::try_push: input frame is empty");
-  }
-
-  auto st = state_;
-  const bool timings = st->timing_enabled;
-  cv::Mat contiguous = input;
-  if (!contiguous.isContinuous()) {
-    contiguous = input.clone();
-  }
-
-  std::chrono::steady_clock::time_point t_alloc_start{};
-  if (timings) t_alloc_start = std::chrono::steady_clock::now();
-  GstBuffer* buf = nullptr;
-  if (st->opt.reuse_input_buffer) {
-    if (!st->reusable_buffer || st->reusable_bytes != st->cfg.bytes) {
-      if (st->reusable_buffer) {
-        gst_buffer_unref(st->reusable_buffer);
-        st->reusable_buffer = nullptr;
-        st->reusable_bytes = 0;
+      const std::string msg = e.what();
+      const bool allow_recover =
+          opt_.auto_recover_dispatcher &&
+          pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+      if (pipeline_internal::match_dispatcher_unavailable(msg) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        PipelineReport rep;
+        rep.repro_note = msg;
+        rep.error_code = pipeline_internal::kDispatcherUnavailableError;
+        if (opt_.on_dispatcher_error) opt_.on_dispatcher_error(rep);
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        run_cache_.reset();
+        reuse_cache = false;
+        continue;
       }
-      st->reusable_buffer =
-          allocate_input_buffer(st->cfg.bytes, st->src_opt, st->pool_guard);
-      st->reusable_bytes = st->cfg.bytes;
+      throw;
     }
-    buf = st->reusable_buffer;
-  } else {
-    buf = allocate_input_buffer(state_->cfg.bytes, state_->src_opt, state_->pool_guard);
-  }
-  std::chrono::steady_clock::time_point t_alloc_end{};
-  if (timings) t_alloc_end = std::chrono::steady_clock::now();
-  if (!buf) {
-    throw std::runtime_error("InputStream::try_push: failed to allocate GstBuffer");
-  }
-
-  GstMapInfo mi{};
-  std::chrono::steady_clock::time_point t_map_start{};
-  if (timings) t_map_start = std::chrono::steady_clock::now();
-  if (!gst_buffer_map(buf, &mi, GST_MAP_WRITE)) {
-    gst_buffer_unref(buf);
-    throw std::runtime_error("InputStream::try_push: failed to map GstBuffer");
-  }
-  std::chrono::steady_clock::time_point t_map_end{};
-  if (timings) t_map_end = std::chrono::steady_clock::now();
-  const size_t input_bytes = contiguous.total() * contiguous.elemSize();
-  const size_t copy_bytes = std::min(input_bytes, state_->cfg.bytes);
-  if (copy_bytes > 0) {
-    std::memcpy(mi.data, contiguous.data, copy_bytes);
-  }
-  if (copy_bytes < state_->cfg.bytes) {
-    std::memset(static_cast<uint8_t*>(mi.data) + copy_bytes, 0,
-                state_->cfg.bytes - copy_bytes);
-  }
-  gst_buffer_unmap(buf, &mi);
-  std::chrono::steady_clock::time_point t_copy_end{};
-  if (timings) t_copy_end = std::chrono::steady_clock::now();
-  if (state_->src_opt.use_simaai_pool &&
-      !maybe_add_simaai_meta(buf, next_input_frame_id(), state_->src_opt)) {
-    gst_buffer_unref(buf);
-    throw std::runtime_error("InputStream::try_push: failed to attach GstSimaMeta");
-  }
-
-  std::chrono::steady_clock::time_point t_push_start{};
-  if (timings) t_push_start = std::chrono::steady_clock::now();
-  GstBuffer* push_buf = buf;
-  if (st->opt.reuse_input_buffer) {
-    push_buf = gst_buffer_ref(buf);
-  }
-  GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(state_->appsrc), push_buf);
-  const auto t_push_end = std::chrono::steady_clock::now();
-
-  if (timings) {
-    st->push_count.fetch_add(1, std::memory_order_relaxed);
-    st->alloc_ns.fetch_add(
-        static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t_alloc_end - t_alloc_start).count()),
-        std::memory_order_relaxed);
-    st->map_ns.fetch_add(
-        static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t_map_end - t_map_start).count()),
-        std::memory_order_relaxed);
-    st->copy_ns.fetch_add(
-        static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t_copy_end - t_map_end).count()),
-        std::memory_order_relaxed);
-    st->push_ns.fetch_add(
-        static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t_push_end - t_push_start).count()),
-        std::memory_order_relaxed);
-  }
-
-  if (ret != GST_FLOW_OK) {
-    if (st->opt.reuse_input_buffer) {
-      gst_buffer_unref(push_buf);
-    } else {
-      gst_buffer_unref(buf);
-    }
-    if (timings) {
-      st->push_failures.fetch_add(1, std::memory_order_relaxed);
-    }
-    return false;
-  }
-  const auto push_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      t_push_end.time_since_epoch()).count();
-  st->last_push_ns.store(static_cast<std::int64_t>(push_ns), std::memory_order_relaxed);
-  return true;
-}
-
-void InputStream::signal_eos() {
-  if (!state_ || !state_->appsrc) return;
-  bool expected = false;
-  if (!state_->eos_sent.compare_exchange_strong(expected, true)) return;
-  GstFlowReturn ret = gst_app_src_end_of_stream(GST_APP_SRC(state_->appsrc));
-  if (ret != GST_FLOW_OK) {
-    throw std::runtime_error("InputStream::signal_eos: gst_app_src_end_of_stream failed");
   }
 }
 
-static RunInputResult output_from_sample_stream(GstSample* sample,
-                                                const char* where,
-                                                bool copy_output) {
-  RunInputResult out;
-  GstCaps* out_caps = gst_sample_get_caps(sample);
-  const GstStructure* st = out_caps ? gst_caps_get_structure(out_caps, 0) : nullptr;
-  const char* media = st ? gst_structure_get_name(st) : nullptr;
-
-  out.caps_string = pipeline_internal::gst_caps_to_string_safe(out_caps);
-  out.media_type = media ? media : "";
-
-  if (media && std::string(media) == "application/vnd.simaai.tensor") {
-    FrameTensorRef ref = pipeline_internal::sample_to_tensor_ref(sample);
-    out.kind = RunOutputKind::Tensor;
-    out.format = ref.format;
-    if (copy_output) {
-      out.tensor = ref.to_copy();
-      out.owned = true;
-    } else {
-      out.tensor_ref = ref;
-      out.owned = false;
-    }
-  } else if (media && std::string(media).rfind("video/x-raw", 0) == 0) {
-    GstVideoInfo info;
-    std::memset(&info, 0, sizeof(info));
-    if (!gst_video_info_from_caps(&info, out_caps)) {
-      throw std::runtime_error(std::string(where) + ": failed to parse video caps");
-    }
-
-    const GstVideoFormat fmt = GST_VIDEO_INFO_FORMAT(&info);
-    if (fmt == GST_VIDEO_FORMAT_NV12) {
-      out.kind = RunOutputKind::FrameNV12;
-      out.frame_nv12 = sample_to_nv12_copy(sample);
-      out.format = "NV12";
-    } else {
-      FrameTensorRef ref = pipeline_internal::sample_to_tensor_ref(sample);
-      out.kind = RunOutputKind::Tensor;
-      out.format = ref.format;
-      if (copy_output) {
-        out.tensor = ref.to_copy();
-        out.owned = true;
-      } else {
-        out.tensor_ref = ref;
-        out.owned = false;
-      }
-    }
-  } else {
-    throw std::runtime_error(std::string(where) + ": unsupported output caps");
-  }
-  return out;
+RunInputResult PipelineSession::run(const NeatTensor& input) {
+  RunInputOptions opt;
+  return run(input, opt);
 }
 
-RunInputResult InputStream::pull(int timeout_ms) {
-  if (!state_ || !state_->pipeline) {
-    throw std::runtime_error("InputStream::pull: stream is closed");
-  }
-  const int timeout = (timeout_ms >= 0) ? timeout_ms : state_->opt.timeout_ms;
-  const bool timings = state_->timing_enabled;
-  std::chrono::steady_clock::time_point t_wait_start{};
-  if (timings) t_wait_start = std::chrono::steady_clock::now();
-  auto sample_opt = pipeline_internal::try_pull_sample_sliced(
-      state_->pipeline, state_->appsink, timeout, state_->diag, "InputStream::pull");
-  std::chrono::steady_clock::time_point t_wait_end{};
-  if (timings) t_wait_end = std::chrono::steady_clock::now();
-  if (!sample_opt.has_value()) {
-    throw std::runtime_error("InputStream::pull: timeout waiting for output");
-  }
-  GstSample* sample = sample_opt.value();
-  std::chrono::steady_clock::time_point t_decode_start{};
-  if (timings) t_decode_start = std::chrono::steady_clock::now();
-  RunInputResult out = output_from_sample_stream(sample, "InputStream::pull", state_->opt.copy_output);
-  std::chrono::steady_clock::time_point t_decode_end{};
-  if (timings) t_decode_end = std::chrono::steady_clock::now();
-  gst_sample_unref(sample);
-  if (timings) {
-    state_->pull_count.fetch_add(1, std::memory_order_relaxed);
-    state_->pull_wait_ns.fetch_add(
-        static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                t_wait_end - t_wait_start).count()),
-        std::memory_order_relaxed);
-    state_->decode_ns.fetch_add(
-        static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                t_decode_end - t_decode_start).count()),
-        std::memory_order_relaxed);
-  }
-  return out;
-}
-
-RunInputResult InputStream::push_and_pull(const cv::Mat& input, int timeout_ms) {
-  push(input);
-  return pull(timeout_ms);
-}
-
-InputStream PipelineSession::run_input_stream(const cv::Mat& sample,
-                                              const InputStreamOptions& opt) {
+RunInputResult PipelineSession::run(const NeatTensor& input, const RunInputOptions& opt) {
   gst_init_once();
-  enforce_push_run_mode(nodes_, "PipelineSession::run_input_stream");
 
   enforce_sink_last(nodes_);
+  enforce_push_run_mode(nodes_, "PipelineSession::run(input)");
 
   const InputAppSrc* src_node = nullptr;
-  require_input_appsrc(nodes_, "PipelineSession::run_input_stream", &src_node);
+  require_input_appsrc(nodes_, "PipelineSession::run(input)", &src_node);
 
-  require_element("appsrc", "PipelineSession::run_input_stream");
-  require_element("appsink", "PipelineSession::run_input_stream");
-  require_element("identity", "PipelineSession::run_input_stream");
+  const int timeout_ms =
+      std::max(10, std::atoi(env_str("SIMA_GST_RUN_INPUT_TIMEOUT_MS", "10000").c_str()));
+  const InputCapsConfig cfg = infer_input_caps(src_node->options(), input);
+  const uint64_t version = nodes_version_.load(std::memory_order_relaxed);
+  bool reuse_cache =
+      run_cache_ &&
+      run_cache_->input_kind == RunInputKind::NeatTensor &&
+      run_cache_->nodes_version == version &&
+      run_input_options_equal(run_cache_->opt, opt) &&
+      caps_equal(run_cache_->caps, cfg);
+  PipelineRunOptions run_opt = sync_run_defaults();
+  run_opt.copy_output = opt.copy_output;
+  run_opt.allow_mismatched_input = !opt.strict;
+  run_opt.reuse_input_buffer = opt.reuse_input_buffer;
+  run_opt.timeout_ms = timeout_ms;
+  run_opt.enable_timings = env_bool("SIMA_RUN_INPUT_TIMINGS", false);
+  run_opt.auto_recover_dispatcher = opt_.auto_recover_dispatcher;
+  run_opt.on_dispatcher_error = opt_.on_dispatcher_error;
+
+  bool recovery_attempted = false;
+  while (true) {
+    try {
+      if (!reuse_cache) {
+        PipelineRun runner = build(input, PipelineRunMode::Sync, run_opt);
+        auto cache = std::make_unique<RunCache>();
+        cache->runner = std::move(runner);
+        cache->caps = cfg;
+        cache->opt = opt;
+        cache->nodes_version = version;
+        cache->input_kind = RunInputKind::NeatTensor;
+        run_cache_ = std::move(cache);
+      }
+      return run_cache_->runner.push_and_pull(input, timeout_ms);
+    } catch (const PipelineError& e) {
+      PipelineReport rep = e.report();
+      const bool allow_recover =
+          opt_.auto_recover_dispatcher &&
+          pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+      if (pipeline_internal::is_dispatcher_unavailable(rep) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        run_cache_.reset();
+        reuse_cache = false;
+        continue;
+      }
+      throw PipelineError(rep.repro_note, std::move(rep));
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      const bool allow_recover =
+          opt_.auto_recover_dispatcher &&
+          pipeline_internal::env_bool("SIMA_DISPATCHER_AUTO_RECOVER", true);
+      if (pipeline_internal::match_dispatcher_unavailable(msg) &&
+          !recovery_attempted &&
+          allow_recover) {
+        recovery_attempted = true;
+        PipelineReport rep;
+        rep.repro_note = msg;
+        rep.error_code = pipeline_internal::kDispatcherUnavailableError;
+        if (opt_.on_dispatcher_error) opt_.on_dispatcher_error(rep);
+        pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
+        run_cache_.reset();
+        reuse_cache = false;
+        continue;
+      }
+      throw;
+    }
+  }
+}
+
+static InputStream run_input_stream_internal(const std::vector<std::shared_ptr<Node>>& nodes,
+                                             const std::shared_ptr<void>& guard,
+                                             const void* owner,
+                                             std::string& last_pipeline,
+                                             const cv::Mat& sample,
+                                             const InputStreamOptions& opt,
+                                             bool insert_queue2,
+                                             bool sync_mode) {
+  gst_init_once();
+  enforce_push_run_mode(nodes, "PipelineSession::build(input)");
+  trace_step("build(input): start");
+
+  const bool has_sink = has_output_appsink(nodes);
+  enforce_sink_last_if_present(nodes, "PipelineSession::build(input)");
+
+  const InputAppSrc* src_node = nullptr;
+  require_input_appsrc(nodes, "PipelineSession::build(input)", &src_node);
+
+  require_element("appsrc", "PipelineSession::build(input)");
+  if (has_sink) {
+    require_element("appsink", "PipelineSession::build(input)");
+    require_element("identity", "PipelineSession::build(input)");
+  }
 
   const bool insert_boundaries =
       should_insert_boundaries_for_mode("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
 
-  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
-  last_pipeline_ = br.pipeline_string;
+  BuildResult br = build_pipeline_full(nodes, insert_boundaries, "mysink", insert_queue2);
+  if (sync_mode) {
+    br.pipeline_string = clamp_sync_pipeline(std::move(br.pipeline_string));
+    br.diag->pipeline_string = br.pipeline_string;
+  }
+  last_pipeline = br.pipeline_string;
+  enforce_mla_pipeline_guard("PipelineSession::build(input)", last_pipeline, owner);
 
   GError* err = nullptr;
-  GstElement* pipeline = gst_parse_launch(last_pipeline_.c_str(), &err);
+  GstElement* pipeline = gst_parse_launch(last_pipeline.c_str(), &err);
   if (!pipeline) {
     std::string msg = err ? err->message : "unknown";
     if (err) g_error_free(err);
     throw std::runtime_error(
-        "PipelineSession::run_input_stream: gst_parse_launch failed: " + msg +
-        "\nPipeline:\n" + last_pipeline_);
+        "PipelineSession::build(input): gst_parse_launch failed: " + msg +
+        "\nPipeline:\n" + last_pipeline);
   }
   if (err) g_error_free(err);
+  trace_step("build(input): parsed");
 
   if (env_bool("SIMA_GST_ENFORCE_NAMES", false)) {
     enforce_names_contract(pipeline, br);
@@ -2990,45 +2879,57 @@ InputStream PipelineSession::run_input_stream(const cv::Mat& sample,
   attach_boundary_probes(pipeline, br.diag);
   attach_stage_timing_probes(pipeline, br.diag);
 
-  GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
-  if (!sink) {
-    maybe_dump_dot(pipeline, "run_input_stream_missing_mysink");
-    stop_and_unref(pipeline);
-    throw std::runtime_error(
-        "PipelineSession::run_input_stream: appsink 'mysink' not found.\n"
-        "Fix: add OutputAppSink() as the last node.\nPipeline:\n" +
-        last_pipeline_);
+  GstElement* sink = nullptr;
+  if (has_sink) {
+    sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
+    if (!sink) {
+      maybe_dump_dot(pipeline, "build_input_missing_mysink");
+      stop_and_unref(pipeline);
+      throw std::runtime_error(
+          "PipelineSession::build(input): appsink 'mysink' not found.\n"
+          "Fix: add OutputAppSink() as the last node.\nPipeline:\n" +
+          last_pipeline);
+    }
+    configure_appsink_for_input_stream(sink, opt);
   }
-  configure_appsink_for_input_stream(sink, opt);
 
   GstElement* appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "mysrc");
   if (!appsrc) {
-    gst_object_unref(sink);
+    if (sink) gst_object_unref(sink);
     stop_and_unref(pipeline);
     throw std::runtime_error(
-        "PipelineSession::run_input_stream: appsrc 'mysrc' not found.\n"
+        "PipelineSession::build(input): appsrc 'mysrc' not found.\n"
         "Fix: add InputAppSrc() as the first node.\nPipeline:\n" +
-        last_pipeline_);
+        last_pipeline);
   }
 
   InputCapsConfig cfg = infer_input_caps(src_node->options(), sample);
-  GstCaps* caps = build_input_caps(cfg);
+  InputAppSrcOptions src_opt = src_node->options();
+  if (sync_mode &&
+      src_opt.pool_min_buffers == 1 &&
+      src_opt.pool_max_buffers == 2) {
+    src_opt.pool_max_buffers = 1;
+  }
+  src_opt.max_bytes = resolve_appsrc_max_bytes(src_opt, cfg);
+  GstCaps* caps = build_input_caps(cfg, src_opt);
   gst_app_src_set_caps(GST_APP_SRC(appsrc), caps);
   gst_caps_unref(caps);
 
-  configure_appsrc(appsrc, src_node->options());
+  configure_appsrc(appsrc, src_opt);
   maybe_log_appsrc_state(appsrc);
-  maybe_log_appsink_state(sink);
+  if (sink) maybe_log_appsink_state(sink);
 
   try {
+    trace_step("build(input): set_state PLAYING");
     set_state_or_throw(pipeline, GST_STATE_PLAYING,
-                       "PipelineSession::run_input_stream", br.diag);
+                       "PipelineSession::build(input)", br.diag);
   } catch (...) {
     gst_object_unref(appsrc);
-    gst_object_unref(sink);
+    if (sink) gst_object_unref(sink);
     stop_and_unref(pipeline);
     throw;
   }
+  trace_step("build(input): playing");
 
   if (env_bool("SIMA_INPUTSTREAM_WARN", false) || env_bool("SIMA_INPUTSTREAM_DEBUG", false)) {
     GstState cur = GST_STATE_VOID_PENDING;
@@ -3036,51 +2937,172 @@ InputStream PipelineSession::run_input_stream(const cv::Mat& sample,
     gst_element_get_state(pipeline, &cur, &pend, 0);
     if (cur < GST_STATE_PAUSED) {
       std::fprintf(stderr,
-                   "[WARN] run_input_stream: pipeline state is %s (pending %s); "
+                   "[WARN] build(input): pipeline state is %s (pending %s); "
                    "streaming may stall until it reaches PAUSED/PLAYING.\n",
                    gst_element_state_get_name(cur),
                    gst_element_state_get_name(pend));
     }
   }
 
-  auto state = std::make_shared<InputStream::State>();
-  state->pipeline = pipeline;
-  state->appsrc = appsrc;
-  state->appsink = sink;
-  state->cfg = cfg;
-  state->src_opt = src_node->options();
-  state->opt = opt;
-  state->diag = br.diag;
-  state->guard = guard_;
-  state->timing_enabled = opt.enable_timings;
-  InputStream stream(std::move(state));
-  if (opt.preflight_run || env_bool("SIMA_INPUTSTREAM_PREFLIGHT_RUN", false)) {
+  InputStream stream = InputStream::create(pipeline,
+                                           appsrc,
+                                           sink,
+                                           cfg,
+                                           src_node->options(),
+                                           opt,
+                                           br.diag,
+                                           guard);
+  if ((opt.preflight_run || env_bool("SIMA_INPUTSTREAM_PREFLIGHT_RUN", false)) && sink) {
     if (env_bool("SIMA_INPUTSTREAM_DEBUG", false)) {
-      std::fprintf(stderr, "[DBG] run_input_stream: preflight push/pull\n");
+      std::fprintf(stderr, "[DBG] build(input): preflight push/pull\n");
     }
+    trace_step("build(input): preflight start");
     (void)stream.push_and_pull(sample, opt.timeout_ms);
+    trace_step("build(input): preflight done");
   }
 
+  trace_step("build(input): done");
   return stream;
 }
 
-AsyncStream PipelineSession::run_async(const cv::Mat& sample,
-                                       const AsyncOptions& async_opt,
-                                       const InputStreamOptions& stream_opt) {
-  InputStreamOptions opt = stream_opt;
-  opt.copy_output = async_opt.copy_output;
-  opt.allow_mismatched_input = async_opt.allow_mismatched_input;
-  opt.timeout_ms = async_opt.timeout_ms;
-  if (async_opt.output_queue > 0) {
-    opt.appsink_max_buffers = async_opt.output_queue;
-  } else {
-    opt.appsink_max_buffers = 0;
-  }
-  opt.appsink_drop = false;
-  opt.appsink_sync = false;
+static InputStream run_input_stream_internal(const std::vector<std::shared_ptr<Node>>& nodes,
+                                             const std::shared_ptr<void>& guard,
+                                             const void* owner,
+                                             std::string& last_pipeline,
+                                             const NeatTensor& sample,
+                                             const InputStreamOptions& opt,
+                                             bool insert_queue2,
+                                             bool sync_mode) {
+  gst_init_once();
+  enforce_push_run_mode(nodes, "PipelineSession::build(input)");
+  trace_step("build(input neat): start");
 
-  InputStream stream = run_input_stream(sample, opt);
-  return AsyncStream::create(std::move(stream), async_opt, opt);
+  const bool has_sink = has_output_appsink(nodes);
+  enforce_sink_last_if_present(nodes, "PipelineSession::build(input)");
+
+  const InputAppSrc* src_node = nullptr;
+  require_input_appsrc(nodes, "PipelineSession::build(input)", &src_node);
+
+  require_element("appsrc", "PipelineSession::build(input)");
+  if (has_sink) {
+    require_element("appsink", "PipelineSession::build(input)");
+    require_element("identity", "PipelineSession::build(input)");
+  }
+
+  const bool insert_boundaries =
+      should_insert_boundaries_for_mode("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
+
+  BuildResult br = build_pipeline_full(nodes, insert_boundaries, "mysink", insert_queue2);
+  if (sync_mode) {
+    br.pipeline_string = clamp_sync_pipeline(std::move(br.pipeline_string));
+    br.diag->pipeline_string = br.pipeline_string;
+  }
+  last_pipeline = br.pipeline_string;
+  enforce_mla_pipeline_guard("PipelineSession::build(input)", last_pipeline, owner);
+
+  GError* err = nullptr;
+  GstElement* pipeline = gst_parse_launch(last_pipeline.c_str(), &err);
+  if (!pipeline) {
+    std::string msg = err ? err->message : "unknown";
+    if (err) g_error_free(err);
+    throw std::runtime_error(
+        "PipelineSession::build(input): gst_parse_launch failed: " + msg +
+        "\nPipeline:\n" + last_pipeline);
+  }
+  if (err) g_error_free(err);
+  trace_step("build(input neat): parsed");
+
+  if (env_bool("SIMA_GST_ENFORCE_NAMES", false)) {
+    enforce_names_contract(pipeline, br);
+  }
+
+  attach_boundary_probes(pipeline, br.diag);
+  attach_stage_timing_probes(pipeline, br.diag);
+
+  GstElement* sink = nullptr;
+  if (has_sink) {
+    sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
+    if (!sink) {
+      maybe_dump_dot(pipeline, "build_input_missing_mysink");
+      stop_and_unref(pipeline);
+      throw std::runtime_error(
+          "PipelineSession::build(input): appsink 'mysink' not found.\n"
+          "Fix: add OutputAppSink() as the last node.\nPipeline:\n" +
+          last_pipeline);
+    }
+    configure_appsink_for_input_stream(sink, opt);
+  }
+
+  GstElement* appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "mysrc");
+  if (!appsrc) {
+    if (sink) gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw std::runtime_error(
+        "PipelineSession::build(input): appsrc 'mysrc' not found.\n"
+        "Fix: add InputAppSrc() as the first node.\nPipeline:\n" +
+        last_pipeline);
+  }
+
+  InputCapsConfig cfg = infer_input_caps(src_node->options(), sample);
+  InputAppSrcOptions src_opt = src_node->options();
+  if (sync_mode &&
+      src_opt.pool_min_buffers == 1 &&
+      src_opt.pool_max_buffers == 2) {
+    src_opt.pool_max_buffers = 1;
+  }
+  src_opt.max_bytes = resolve_appsrc_max_bytes(src_opt, cfg);
+  GstCaps* caps = build_input_caps(cfg, src_opt);
+  gst_app_src_set_caps(GST_APP_SRC(appsrc), caps);
+  gst_caps_unref(caps);
+
+  configure_appsrc(appsrc, src_opt);
+  maybe_log_appsrc_state(appsrc);
+  if (sink) maybe_log_appsink_state(sink);
+
+  try {
+    trace_step("build(input neat): set_state PLAYING");
+    set_state_or_throw(pipeline, GST_STATE_PLAYING,
+                       "PipelineSession::build(input)", br.diag);
+  } catch (...) {
+    gst_object_unref(appsrc);
+    if (sink) gst_object_unref(sink);
+    stop_and_unref(pipeline);
+    throw;
+  }
+  trace_step("build(input neat): playing");
+
+  if (env_bool("SIMA_INPUTSTREAM_WARN", false) || env_bool("SIMA_INPUTSTREAM_DEBUG", false)) {
+    GstState cur = GST_STATE_VOID_PENDING;
+    GstState pend = GST_STATE_VOID_PENDING;
+    gst_element_get_state(pipeline, &cur, &pend, 0);
+    if (cur < GST_STATE_PAUSED) {
+      std::fprintf(stderr,
+                   "[WARN] build(input): pipeline state is %s (pending %s); "
+                   "streaming may stall until it reaches PAUSED/PLAYING.\n",
+                   gst_element_state_get_name(cur),
+                   gst_element_state_get_name(pend));
+    }
+  }
+
+  InputStream stream = InputStream::create(pipeline,
+                                           appsrc,
+                                           sink,
+                                           cfg,
+                                           src_node->options(),
+                                           opt,
+                                           br.diag,
+                                           guard);
+  if ((opt.preflight_run || env_bool("SIMA_INPUTSTREAM_PREFLIGHT_RUN", false)) && sink) {
+    if (env_bool("SIMA_INPUTSTREAM_DEBUG", false)) {
+      std::fprintf(stderr, "[DBG] build(input): preflight push/pull\n");
+    }
+    trace_step("build(input neat): preflight start");
+    (void)stream.push_and_pull(sample, opt.timeout_ms);
+    trace_step("build(input neat): preflight done");
+  }
+
+  trace_step("build(input neat): done");
+  return stream;
 }
 
 TapStream PipelineSession::run_tap(const std::string& point_name) {
@@ -3094,6 +3116,7 @@ TapStream PipelineSession::run_tap(const std::string& point_name) {
 
   BuildResult br = build_pipeline_tap(nodes_, point_name, insert_boundaries);
   last_pipeline_ = br.pipeline_string;
+  enforce_mla_pipeline_guard("PipelineSession::run_tap", last_pipeline_, this);
 
   auto guard = guard_;
 
@@ -3181,8 +3204,9 @@ PipelineReport PipelineSession::validate(const ValidateOptions& opt) const {
   const bool insert_boundaries =
       should_insert_boundaries_for_mode("SIMA_GST_VALIDATE_INSERT_BOUNDARIES", true);
 
-  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink", false);
   rep.pipeline_string = br.pipeline_string;
+  enforce_mla_pipeline_guard("PipelineSession::validate", rep.pipeline_string, this);
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(rep.pipeline_string.c_str(), &err);
@@ -3291,8 +3315,9 @@ PipelineReport PipelineSession::validate(const ValidateOptions& opt,
   const bool insert_boundaries =
       should_insert_boundaries_for_mode("SIMA_GST_VALIDATE_INSERT_BOUNDARIES", true);
 
-  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink", false);
   rep.pipeline_string = br.pipeline_string;
+  enforce_mla_pipeline_guard("PipelineSession::validate(input)", rep.pipeline_string, this);
 
   GError* err = nullptr;
   GstElement* pipeline = gst_parse_launch(rep.pipeline_string.c_str(), &err);
@@ -3333,11 +3358,14 @@ PipelineReport PipelineSession::validate(const ValidateOptions& opt,
   }
 
   InputCapsConfig cfg = infer_input_caps(src_node->options(), input);
-  GstCaps* caps = build_input_caps(cfg);
+  InputAppSrcOptions src_opt = src_node->options();
+  src_opt.max_bytes = resolve_appsrc_max_bytes(src_opt, cfg);
+
+  GstCaps* caps = build_input_caps(cfg, src_opt);
   gst_app_src_set_caps(GST_APP_SRC(appsrc), caps);
   gst_caps_unref(caps);
 
-  configure_appsrc(appsrc, src_node->options());
+  configure_appsrc(appsrc, src_opt);
 
   try {
     set_state_or_throw(pipeline, GST_STATE_PAUSED, "PipelineSession::validate(input)", br.diag);
@@ -3569,7 +3597,7 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
 
   if (dbg_indices.empty()) {
     try {
-      auto build_stream = [&]() -> FrameStream {
+      auto build_stream = [&]() -> TensorStream {
         enforce_sink_last(nodes_);
 
         require_element("appsink", "PipelineSession::run_debug");
@@ -3578,8 +3606,9 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
         const bool insert_boundaries =
             should_insert_boundaries_for_mode("SIMA_GST_RUN_INSERT_BOUNDARIES", false);
 
-        BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+        BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink", false);
         last_pipeline_ = br.pipeline_string;
+        enforce_mla_pipeline_guard("PipelineSession::run_debug", last_pipeline_, this);
 
         auto guard = guard_;
 
@@ -3619,17 +3648,17 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
           throw;
         }
 
-        FrameStream fs(pipeline, sink);
-        fs.set_debug_pipeline(last_pipeline_);
-        fs.set_diag(br.diag);
-        fs.set_guard(std::move(guard));
-        return fs;
+        TensorStream ts(pipeline, sink);
+        ts.set_debug_pipeline(last_pipeline_);
+        ts.set_diag(br.diag);
+        ts.set_guard(std::move(guard));
+        return ts;
       };
 
-      FrameStream fs = build_stream();
-      out.first_frame = fs.next_copy(opt.timeout_ms);
-      out.report = fs.report_snapshot(/*heavy=*/true);
-      fs.close();
+      TensorStream ts = build_stream();
+      out.first_frame = ts.next_copy(opt.timeout_ms);
+      out.report = ts.report_snapshot(/*heavy=*/true);
+      ts.close();
       if (out.report.repro_note.empty()) {
         out.report.repro_note = "run_debug: OK (no DebugPoint nodes)";
       }
@@ -3727,6 +3756,7 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
   try {
     for (size_t i = 0; i < segment_strings.size(); ++i) {
       GError* err = nullptr;
+      enforce_mla_pipeline_guard("PipelineSession::run_debug", segment_strings[i], this);
       pipelines[i] = gst_parse_launch(segment_strings[i].c_str(), &err);
       if (!pipelines[i]) {
         std::string msg = err ? err->message : "unknown";
@@ -3797,9 +3827,10 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
         tap.packet = sample_to_tap_packet(sample, dbg_indices[i], sink_names[i]);
 
         try {
-          tap.tensor = pipeline_internal::sample_to_tensor_ref(sample);
+          NeatTensor neat = from_gst_sample(sample);
+          tap.tensor = neat;
           tap.last_good_tensor = tap.tensor;
-          out.tensors.emplace(tap.name, *tap.tensor);
+          out.tensors.emplace(tap.name, std::move(neat));
         } catch (...) {
           // Non-raw taps are allowed; tensor conversion is best-effort.
         }
@@ -3890,8 +3921,8 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt, const cv::
   if (dbg_indices.empty()) {
     try {
       RunInputResult r = run(input);
-      if (r.kind == RunOutputKind::FrameNV12 && r.frame_nv12.has_value()) {
-        out.first_frame = r.frame_nv12;
+      if (r.neat.has_value()) {
+        out.first_frame = r.neat;
       }
       out.report.pipeline_string = last_pipeline_;
       out.report.repro_note = "run_debug(input): OK (no DebugPoint nodes)";
@@ -3978,6 +4009,9 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt, const cv::
   std::vector<GstElement*> sinks(segment_strings.size(), nullptr);
   std::vector<GstElement*> srcs(segment_strings.size(), nullptr);
   std::vector<std::string> seg_errors(segment_strings.size());
+  InputCapsConfig cfg = infer_input_caps(src_node->options(), input);
+  InputAppSrcOptions src_opt = src_node->options();
+  src_opt.max_bytes = resolve_appsrc_max_bytes(src_opt, cfg);
 
   auto cleanup = [&]() {
     for (auto* s : sinks) {
@@ -3994,6 +4028,7 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt, const cv::
   try {
     for (size_t i = 0; i < segment_strings.size(); ++i) {
       GError* err = nullptr;
+      enforce_mla_pipeline_guard("PipelineSession::run_debug(input)", segment_strings[i], this);
       pipelines[i] = gst_parse_launch(segment_strings[i].c_str(), &err);
       if (!pipelines[i]) {
         std::string msg = err ? err->message : "unknown";
@@ -4014,7 +4049,7 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt, const cv::
         if (!seg_errors[i].empty()) seg_errors[i] += "; ";
         seg_errors[i] += "appsrc '" + src_names[i] + "' not found";
       }
-      configure_appsrc(srcs[i], src_node->options());
+      configure_appsrc(srcs[i], src_opt);
     }
 
     for (size_t i = 0; i < pipelines.size(); ++i) {
@@ -4035,8 +4070,7 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt, const cv::
 
     InputBufferPoolGuard pool_guard;
     if (pipelines.size() > 0 && seg_errors[0].empty() && srcs[0]) {
-      InputCapsConfig cfg = infer_input_caps(src_node->options(), input);
-      GstCaps* caps = build_input_caps(cfg);
+      GstCaps* caps = build_input_caps(cfg, src_opt);
       gst_app_src_set_caps(GST_APP_SRC(srcs[0]), caps);
       gst_caps_unref(caps);
 
@@ -4100,9 +4134,10 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt, const cv::
         tap.packet = sample_to_tap_packet(sample, dbg_indices[i], sink_names[i]);
 
         try {
-          tap.tensor = pipeline_internal::sample_to_tensor_ref(sample);
+          NeatTensor neat = from_gst_sample(sample);
+          tap.tensor = neat;
           tap.last_good_tensor = tap.tensor;
-          out.tensors.emplace(tap.name, *tap.tensor);
+          out.tensors.emplace(tap.name, std::move(neat));
         } catch (...) {
           // Best-effort tensor conversion.
         }
@@ -4216,7 +4251,7 @@ std::string PipelineSession::describe(const GraphPrinter::Options& opt) const {
 }
 
 std::string PipelineSession::to_gst(bool insert_boundaries) const {
-  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink");
+  BuildResult br = build_pipeline_full(nodes_, insert_boundaries, "mysink", false);
   return br.pipeline_string;
 }
 

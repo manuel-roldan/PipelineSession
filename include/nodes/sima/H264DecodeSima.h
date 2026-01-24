@@ -14,7 +14,8 @@ public:
   H264Decode(int sima_allocator_type = 2,
              std::string out_format = "NV12",
              std::string decoder_name = {},
-             bool raw_output = false);
+             bool raw_output = false,
+             std::string next_element = {});
   std::string kind() const override { return "H264Decode"; }
 
   std::string gst_fragment(int node_index) const override;
@@ -25,12 +26,14 @@ public:
   const std::string& out_format() const { return out_format_; }
   const std::string& decoder_name() const { return decoder_name_; }
   bool raw_output() const { return raw_output_; }
+  const std::string& next_element() const { return next_element_; }
 
 private:
   int sima_allocator_type_ = 2;
   std::string out_format_ = "NV12";
   std::string decoder_name_;
   bool raw_output_ = false;
+  std::string next_element_;
 };
 
 } // namespace sima
@@ -39,5 +42,6 @@ namespace sima::nodes {
 std::shared_ptr<sima::Node> H264Decode(int sima_allocator_type = 2,
                                        std::string out_format = "NV12",
                                        std::string decoder_name = {},
-                                       bool raw_output = false);
+                                       bool raw_output = false,
+                                       std::string next_element = {});
 } // namespace sima::nodes

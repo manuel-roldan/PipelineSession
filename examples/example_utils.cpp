@@ -165,7 +165,7 @@ std::string resolve_resnet50_tar() {
   return "";
 }
 
-std::string resolve_yolov8s_tar(const fs::path& root_in) {
+std::string resolve_yolov8s_tar_local_first(const fs::path& root_in, bool skip_download) {
   const fs::path root = root_in.empty() ? fs::current_path() : root_in;
   const fs::path tmp_tar = root / "tmp" / "yolo_v8s_mpk.tar.gz";
 
@@ -174,8 +174,10 @@ std::string resolve_yolov8s_tar(const fs::path& root_in) {
     return std::string(env);
   }
 
-  const int rc = std::system("sima-cli modelzoo get yolo_v8s");
-  if (rc == 0 && fs::exists(tmp_tar)) return tmp_tar.string();
+  const fs::path direct_tar = root / "yolo_v8s_mpk.tar.gz";
+  if (fs::exists(direct_tar)) return direct_tar.string();
+
+  if (fs::exists(tmp_tar)) return tmp_tar.string();
 
   const char* home = std::getenv("HOME");
   const fs::path home_path = home ? fs::path(home) : fs::path();
@@ -206,7 +208,26 @@ std::string resolve_yolov8s_tar(const fs::path& root_in) {
     }
   }
 
+  if (!skip_download) {
+    const int rc = std::system("sima-cli modelzoo get yolo_v8s");
+    if (rc == 0 && fs::exists(tmp_tar)) return tmp_tar.string();
+  }
+
+  for (const auto& dir : search_dirs) {
+    if (dir.empty()) continue;
+    for (const auto& name : names) {
+      fs::path candidate = dir / name;
+      if (fs::exists(candidate) && move_to_tmp(candidate, tmp_tar)) {
+        return tmp_tar.string();
+      }
+    }
+  }
+
   return "";
+}
+
+std::string resolve_yolov8s_tar(const fs::path& root_in) {
+  return resolve_yolov8s_tar_local_first(root_in, false);
 }
 
 fs::path ensure_coco_sample(const fs::path& root_in) {

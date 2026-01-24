@@ -29,7 +29,11 @@ sima::NodeGroup RtspInputGroup(const RtspInputGroupOptions& opt) {
 
   nodes.push_back(nodes::RTSPInput(opt.url, opt.latency_ms, opt.tcp));
   if (opt.insert_queue) nodes.push_back(nodes::Queue());
-  nodes.push_back(nodes::H264DepayParse(opt.payload_type));
+  nodes.push_back(nodes::H264DepayParse(opt.payload_type,
+                                        opt.h264_parse_config_interval,
+                                        opt.h264_fps,
+                                        opt.h264_width,
+                                        opt.h264_height));
 
   if (opt.debug.enable && opt.debug.encoded) {
     nodes.push_back(nodes::DebugPoint(opt.debug.encoded_name));
@@ -40,7 +44,8 @@ sima::NodeGroup RtspInputGroup(const RtspInputGroupOptions& opt) {
   nodes.push_back(nodes::H264Decode(opt.sima_allocator_type,
                                     opt.out_format,
                                     opt.decoder_name,
-                                    opt.decoder_raw_output));
+                                    opt.decoder_raw_output,
+                                    opt.decoder_next_element));
 
   if (opt.debug.enable && opt.debug.decoded) {
     nodes.push_back(nodes::DebugPoint(opt.debug.decoded_name));

@@ -1,5 +1,8 @@
 #include "nodes/sima/Preproc.h"
 
+#include "ModelSession.hpp"
+#include "mpk/ModelMPK.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -27,6 +30,8 @@ using json = nlohmann::json;
 struct Preproc::PreprocConfigHolder {
   std::string path;
   bool keep = false;
+  json config;
+  bool has_config = false;
   ~PreprocConfigHolder() {
     if (!keep && !path.empty()) {
       std::remove(path.c_str());
@@ -70,6 +75,31 @@ std::vector<std::string> output_memory_order_default(const PreprocOptions& opt) 
   return {"output_tessellated_image", "output_rgb_image"};
 }
 
+bool has_next_cpu_manual(const json& j) {
+  if (!j.contains("simaai__params") || !j["simaai__params"].is_object()) return false;
+  const json& params = j["simaai__params"];
+  if (!params.contains("next_cpu_manual")) return false;
+  const json& val = params["next_cpu_manual"];
+  if (val.is_boolean()) return val.get<bool>();
+  if (val.is_number_integer()) return val.get<int>() != 0;
+  if (val.is_string()) return val.get<std::string>() != "0";
+  return false;
+}
+
+void set_next_cpu_manual(json& j) {
+  if (!j.contains("simaai__params") || !j["simaai__params"].is_object()) {
+    j["simaai__params"] = json::object();
+  }
+  j["simaai__params"]["next_cpu_manual"] = 1;
+}
+
+std::string find_preproc_config_path(const sima::mpk::ModelMPK& model) {
+  std::string path = model.find_config_path_by_plugin("process_cvu");
+  if (path.empty()) path = model.find_config_path_by_plugin("preproc");
+  if (path.empty()) path = model.find_config_path_by_processor("CVU");
+  return path;
+}
+
 std::string make_temp_json_path(const std::string& dir) {
   std::string root = dir.empty() ? "/tmp" : dir;
   std::error_code ec;
@@ -90,6 +120,46 @@ std::string make_temp_json_path(const std::string& dir) {
   return std::string(buf.data());
 }
 
+json load_json_file(const std::string& path, const char* label) {
+  std::ifstream in(path);
+  if (!in.is_open()) {
+    throw std::runtime_error(std::string(label) + ": failed to open config: " + path);
+  }
+  json j;
+  in >> j;
+  return j;
+}
+
+void write_json_file(const json& j, const std::string& path, const char* label) {
+  std::ofstream out(path);
+  if (!out.is_open()) {
+    throw std::runtime_error(std::string(label) + ": failed to open config: " + path);
+  }
+  out << j.dump(4);
+}
+
+std::string write_json_temp(const json& j, const std::string& dir) {
+  const std::string path = make_temp_json_path(dir);
+  write_json_file(j, path, "Preproc");
+  return path;
+}
+
+} // namespace
+
+PreprocOptions::PreprocOptions(const sima::mpk::ModelMPK& model) {
+  const std::string path = find_preproc_config_path(model);
+  if (path.empty()) {
+    throw std::runtime_error("PreprocOptions: failed to locate preproc config");
+  }
+  config_json = load_json_file(path, "PreprocOptions");
+  next_cpu.clear();
+}
+
+PreprocOptions::PreprocOptions(const simaai::ModelSession& model)
+    : PreprocOptions(model.model()) {}
+
+namespace {
+
 json build_preproc_json(const PreprocOptions& opt,
                         int in_w,
                         int in_h,
@@ -106,7 +176,10 @@ json build_preproc_json(const PreprocOptions& opt,
   j["graph_name"] = opt.graph_name;
   j["node_name"] = opt.node_name;
   j["cpu"] = opt.cpu;
-  j["next_cpu"] = opt.next_cpu;
+  if (!opt.next_cpu.empty()) {
+    j["next_cpu"] = opt.next_cpu;
+    set_next_cpu_manual(j);
+  }
 
   j["input_buffers"] = json::array({
       {
@@ -212,23 +285,6 @@ json build_preproc_json(const PreprocOptions& opt,
   return j;
 }
 
-std::string write_preproc_json(const PreprocOptions& opt,
-                               int in_w,
-                               int in_h,
-                               int out_w,
-                               int out_h,
-                               int scaled_w,
-                               int scaled_h) {
-  const std::string path = make_temp_json_path(opt.config_dir);
-  std::ofstream out(path);
-  if (!out.is_open()) {
-    throw std::runtime_error("Preproc: failed to open config: " + path);
-  }
-  const json j = build_preproc_json(opt, in_w, in_h, out_w, out_h, scaled_w, scaled_h);
-  out << j.dump(4);
-  return path;
-}
-
 } // namespace
 
 Preproc::Preproc(PreprocOptions opt) : opt_(std::move(opt)) {
@@ -250,17 +306,40 @@ Preproc::Preproc(PreprocOptions opt) : opt_(std::move(opt)) {
     opt_.output_channels = channels_from_format(opt_.output_img_type, 3);
   }
 
+  auto holder = std::make_shared<PreprocConfigHolder>();
+  if (opt_.config_json.has_value()) {
+    holder->config = *opt_.config_json;
+    holder->has_config = true;
+    if (!opt_.next_cpu.empty()) {
+      holder->config["next_cpu"] = opt_.next_cpu;
+      set_next_cpu_manual(holder->config);
+    }
+    if (!opt_.config_path.empty()) {
+      config_path_ = opt_.config_path;
+      write_json_file(holder->config, config_path_, "Preproc");
+      holder->keep = true;
+    } else {
+      config_path_ = write_json_temp(holder->config, opt_.config_dir);
+      holder->keep = opt_.keep_config;
+    }
+    holder->path = config_path_;
+    config_holder_ = std::move(holder);
+    return;
+  }
+
   if (!opt_.config_path.empty()) {
     config_path_ = opt_.config_path;
-    auto holder = std::make_shared<PreprocConfigHolder>();
+    holder->config = load_json_file(config_path_, "Preproc");
+    holder->has_config = true;
     holder->path = config_path_;
     holder->keep = true;
     config_holder_ = std::move(holder);
     return;
   }
 
-  config_path_ = write_preproc_json(opt_, in_w, in_h, out_w, out_h, scaled_w, scaled_h);
-  auto holder = std::make_shared<PreprocConfigHolder>();
+  holder->config = build_preproc_json(opt_, in_w, in_h, out_w, out_h, scaled_w, scaled_h);
+  holder->has_config = true;
+  config_path_ = write_json_temp(holder->config, opt_.config_dir);
   holder->path = config_path_;
   holder->keep = opt_.keep_config;
   config_holder_ = std::move(holder);
@@ -269,7 +348,9 @@ Preproc::Preproc(PreprocOptions opt) : opt_(std::move(opt)) {
 std::string Preproc::gst_fragment(int node_index) const {
   std::ostringstream ss;
   ss << "simaaiprocesscvu name=n" << node_index << "_preproc";
-  ss << " config=\"" << config_path_ << "\"";
+  if (!config_path_.empty()) {
+    ss << " config=\"" << config_path_ << "\"";
+  }
   if (opt_.num_buffers > 0) {
     ss << " num-buffers=" << opt_.num_buffers;
   }
@@ -302,6 +383,40 @@ OutputSpec Preproc::output_spec(const OutputSpec& input) const {
   out.note = "simaaiprocesscvu";
   out.byte_size = expected_byte_size(out);
   return out;
+}
+
+bool Preproc::set_next_cpu_if_auto(const std::string& next_cpu) {
+  if (!config_holder_ || !config_holder_->has_config) return false;
+  if (next_cpu.empty()) return false;
+  json& j = config_holder_->config;
+  if (has_next_cpu_manual(j)) return false;
+  j["next_cpu"] = next_cpu;
+  opt_.next_cpu = next_cpu;
+  if (!config_path_.empty()) {
+    write_json_file(j, config_path_, "Preproc");
+  }
+  return true;
+}
+
+const nlohmann::json* Preproc::config_json() const {
+  if (!config_holder_ || !config_holder_->has_config) return nullptr;
+  return &config_holder_->config;
+}
+
+bool Preproc::override_config_json(const std::function<void(json&)>& edit,
+                                   const std::string& tag) {
+  (void)tag;
+  if (!config_holder_ || !config_holder_->has_config) return false;
+  json cfg = config_holder_->config;
+  edit(cfg);
+  config_path_ = write_json_temp(cfg, opt_.config_dir);
+  auto holder = std::make_shared<PreprocConfigHolder>();
+  holder->config = std::move(cfg);
+  holder->has_config = true;
+  holder->path = config_path_;
+  holder->keep = false;
+  config_holder_ = std::move(holder);
+  return true;
 }
 
 } // namespace sima

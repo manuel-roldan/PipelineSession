@@ -16,16 +16,18 @@ struct InputAppSrcOptions {
   int width = -1;
   int height = -1;
   int depth = -1;
+  // Optional full caps string override (used for multi-tensor caps).
+  std::string caps_override;
 
   bool is_live = true;
   bool do_timestamp = true;
-  bool block = false;
+  bool block = true;
   int stream_type = 0; // GST_APP_STREAM_TYPE_STREAM
   std::uint64_t max_bytes = 0;
 
   bool use_simaai_pool = true;
-  int pool_min_buffers = 5;
-  int pool_max_buffers = 5;
+  int pool_min_buffers = 1;
+  int pool_max_buffers = 2;
 
   // Buffer name for GstSimaMeta (should match upstream element name).
   std::string buffer_name = "decoder";

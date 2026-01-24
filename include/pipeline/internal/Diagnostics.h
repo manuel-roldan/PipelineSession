@@ -61,9 +61,21 @@ struct StageTimingCounters {
   }
 };
 
+struct NextCpuDecision {
+  int node_index = -1;
+  std::string node_kind;
+  std::string node_label;
+  std::string next_cpu;
+  bool applied = false;
+};
+
 struct DiagCtx {
   std::string pipeline_string;
   std::vector<NodeReport> node_reports;
+
+  bool queue2_enabled = false;
+  int queue2_depth = 0;
+  std::vector<NextCpuDecision> next_cpu_decisions;
 
   mutable std::mutex bus_mu;
   std::vector<BusMessage> bus;

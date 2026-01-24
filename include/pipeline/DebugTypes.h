@@ -1,7 +1,7 @@
 #pragma once
 
 #include "sima/builder/OutputSpec.h"
-#include "sima/pipeline/TensorTypes.h"
+#include "pipeline/NeatTensorCore.h"
 
 #include <functional>
 #include <memory>
@@ -24,7 +24,7 @@ struct DebugOutput {
   bool tensorizable = false;
   bool unknown = false;
   std::vector<std::string> warnings;
-  std::optional<FrameTensor> tensor; // owning tensor (when available)
+  std::optional<NeatTensor> tensor; // owning tensor (when available)
   std::vector<uint8_t> bytes;        // raw bytes for non-tensorizable outputs
 };
 

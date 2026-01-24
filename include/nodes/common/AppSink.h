@@ -10,7 +10,7 @@ namespace sima {
 
 struct OutputAppSinkOptions {
   int max_buffers = 1;
-  bool drop = true;
+  bool drop = false;
   bool sync = false;
 
   static OutputAppSinkOptions Latest();

@@ -31,10 +31,12 @@ public:
             std::vector<float> channel_mean = {},
             std::vector<float> channel_stddev = {});
 
-  sima::FrameTensor run_tensor(const cv::Mat& input);
+  sima::NeatTensor run_tensor(const cv::Mat& input);
   cv::Mat run(const cv::Mat& input);
   void close();
   const std::string& last_error() const { return last_error_; }
+  const sima::mpk::ModelMPK& model() const;
+  bool initialized() const { return initialized_; }
 
 private:
   void build_session(const std::string& tar_gz,
@@ -48,7 +50,7 @@ private:
   bool initialized_ = false;
   bool tensor_mode_ = false;
   sima::PipelineSession session_;
-  sima::mpk::ModelMPK pack_;
+  std::unique_ptr<sima::mpk::ModelMPK> pack_;
   std::shared_ptr<void> guard_;
   std::unique_ptr<StreamState> stream_;
   std::string last_error_;

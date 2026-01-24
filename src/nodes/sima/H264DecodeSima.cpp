@@ -11,11 +11,13 @@ namespace sima {
 H264Decode::H264Decode(int sima_allocator_type,
                        std::string out_format,
                        std::string decoder_name,
-                       bool raw_output)
+                       bool raw_output,
+                       std::string next_element)
     : sima_allocator_type_(sima_allocator_type),
       out_format_(std::move(out_format)),
       decoder_name_(std::move(decoder_name)),
-      raw_output_(raw_output) {}
+      raw_output_(raw_output),
+      next_element_(std::move(next_element)) {}
 
 std::string H264Decode::gst_fragment(int node_index) const {
   const std::string dec = decoder_name_.empty()
@@ -38,6 +40,9 @@ std::string H264Decode::gst_fragment(int node_index) const {
         ss << " dec-fmt=" << dec_fmt;
       }
     }
+    if (!next_element_.empty()) {
+      ss << " next-element=" << next_element_;
+    }
     return ss.str();
   }
 
@@ -49,6 +54,9 @@ std::string H264Decode::gst_fragment(int node_index) const {
      << " sima-allocator-type=" << sima_allocator_type_;
   if (!decoder_name_.empty()) {
     ss << " op-buff-name=" << decoder_name_;
+  }
+  if (!next_element_.empty()) {
+    ss << " next-element=" << next_element_;
   }
   ss
      << " ! videoconvert name=" << vc
@@ -88,11 +96,13 @@ namespace sima::nodes {
 std::shared_ptr<sima::Node> H264Decode(int sima_allocator_type,
                                        std::string out_format,
                                        std::string decoder_name,
-                                       bool raw_output) {
+                                       bool raw_output,
+                                       std::string next_element) {
   return std::make_shared<sima::H264Decode>(sima_allocator_type,
                                             std::move(out_format),
                                             std::move(decoder_name),
-                                            raw_output);
+                                            raw_output,
+                                            std::move(next_element));
 }
 
 } // namespace sima::nodes

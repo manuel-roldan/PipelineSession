@@ -38,6 +38,7 @@ struct NodeReport {
 
 struct PipelineReport {
   std::string pipeline_string;
+  std::string error_code;
 
   std::vector<NodeReport> nodes;
   std::vector<BusMessage> bus;

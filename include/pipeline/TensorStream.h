@@ -2,7 +2,7 @@
 #pragma once
 
 #include "sima/pipeline/PipelineReport.h"
-#include "sima/pipeline/TensorTypes.h"
+#include "sima/pipeline/NeatTensorCore.h"
 
 #include <memory>
 #include <optional>
@@ -27,8 +27,8 @@ public:
 
   explicit operator bool() const noexcept { return pipeline_ != nullptr && appsink_ != nullptr; }
 
-  std::optional<FrameTensorRef> next(int timeout_ms);
-  std::optional<FrameTensor> next_copy(int timeout_ms);
+  std::optional<NeatTensor> next(int timeout_ms);
+  std::optional<NeatTensor> next_copy(int timeout_ms);
 
   PipelineReport report_snapshot(bool heavy) const;
   void close();

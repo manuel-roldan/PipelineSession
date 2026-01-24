@@ -32,6 +32,7 @@ std::string PipelineReport::to_json() const {
 
   ss << "{";
   ss << "\"pipeline_string\":\"" << json_escape(pipeline_string) << "\",";
+  ss << "\"error_code\":\"" << json_escape(error_code) << "\",";
 
   ss << "\"nodes\":[";
   for (size_t i = 0; i < nodes.size(); ++i) {

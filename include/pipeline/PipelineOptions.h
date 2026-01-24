@@ -3,10 +3,12 @@
 #include "sima/nodes/common/AppSink.h"
 #include "sima/pipeline/PipelineReport.h"
 #include "sima/pipeline/TapStream.h"
-#include "sima/pipeline/FrameStream.h"
 #include "sima/pipeline/TensorTypes.h"
+#include "sima/pipeline/NeatTensor.h"
+#include "sima/pipeline/NeatTensorCore.h"
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -39,9 +41,19 @@ enum class PipelineOutputKind {
   Tensor,
 };
 
+enum class PipelineRunMode {
+  Async,
+  Sync,
+};
+
 struct PipelineSessionOptions {
   PipelineOutputKind output_kind = PipelineOutputKind::Frame;
   int callback_timeout_ms = 1000;
+  int throughput_depth = 8;
+  // Insert queue2 between stages for async build(input) pipelines.
+  bool enable_async_queue2 = true;
+  bool auto_recover_dispatcher = true;
+  std::function<void(const PipelineReport&)> on_dispatcher_error;
 };
 
 struct OutputTensorOptions {
@@ -62,14 +74,13 @@ struct OutputTensorOptions {
 struct RunDebugTap {
   std::string name;
   std::optional<TapPacket> packet;
-  std::optional<FrameTensorRef> tensor;
-  std::optional<FrameTensorRef> last_good_tensor;
+  std::optional<NeatTensor> tensor;
+  std::optional<NeatTensor> last_good_tensor;
   std::string error;
 };
 
 enum class RunOutputKind {
   Tensor,
-  FrameNV12,
   Unknown,
 };
 
@@ -77,9 +88,7 @@ struct RunInputResult {
   RunOutputKind kind = RunOutputKind::Unknown;
   bool owned = true;
 
-  std::optional<FrameTensor> tensor;
-  std::optional<FrameTensorRef> tensor_ref;
-  std::optional<FrameNV12> frame_nv12;
+  std::optional<NeatTensor> neat;
 
   std::string caps_string;
   std::string media_type;
@@ -87,9 +96,9 @@ struct RunInputResult {
 };
 
 struct RunDebugResult {
-  std::optional<FrameNV12> first_frame; // tight packed copy
+  std::optional<NeatTensor> first_frame;
   std::vector<RunDebugTap> taps;
-  std::unordered_map<std::string, FrameTensorRef> tensors;
+  std::unordered_map<std::string, NeatTensor> tensors;
   PipelineReport report;
 };
 
