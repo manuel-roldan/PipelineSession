@@ -21,6 +21,7 @@ namespace sima {
 
 struct InputAppSrcOptions;
 struct InputCapsConfig;
+struct RunOutput;
 
 namespace pipeline_internal {
 struct DiagCtx;
@@ -70,6 +71,8 @@ public:
   bool try_push(const cv::Mat& input);
   void push(const NeatTensor& input);
   bool try_push(const NeatTensor& input);
+  void push_message(const RunOutput& msg);
+  bool try_push_message(const RunOutput& msg);
   void push_holder(const std::shared_ptr<void>& holder);
   bool try_push_holder(const std::shared_ptr<void>& holder);
   RunInputResult pull(int timeout_ms = -1);
@@ -91,7 +94,10 @@ private:
 
   explicit InputStream(std::shared_ptr<State> state);
   bool push_with_fill(const char* where,
-                      const std::function<size_t(uint8_t*, size_t)>& fill);
+                      const std::function<size_t(uint8_t*, size_t)>& fill,
+                      const std::optional<int64_t>& frame_id_override,
+                      const std::optional<std::string>& stream_id_override,
+                      const std::optional<std::string>& buffer_name_override);
   friend class PipelineSession;
   friend class PipelineRun;
 };

@@ -1,5 +1,7 @@
 #include "pipeline/NeatTensorCore.h"
 
+#include "pipeline/internal/NeatTensorTransfer.h"
+
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -78,6 +80,57 @@ std::size_t dense_size_bytes(const std::vector<int64_t>& shape,
     total *= static_cast<std::size_t>(dim);
   }
   return total;
+}
+
+bool copy_dense_strided(const uint8_t* src,
+                        std::size_t src_bytes,
+                        const std::vector<int64_t>& shape,
+                        const std::vector<int64_t>& src_strides,
+                        std::size_t elem_bytes,
+                        uint8_t* dst) {
+  if (!src || !dst) return false;
+  if (shape.empty()) return true;
+  if (src_strides.size() != shape.size()) return false;
+
+  std::size_t max_offset = 0;
+  for (size_t i = 0; i < shape.size(); ++i) {
+    const int64_t dim = shape[i];
+    const int64_t stride = src_strides[i];
+    if (dim <= 0 || stride <= 0) return false;
+    max_offset += static_cast<std::size_t>(dim - 1) *
+                  static_cast<std::size_t>(stride);
+  }
+  if (src_bytes > 0 && max_offset + elem_bytes > src_bytes) {
+    return false;
+  }
+
+  const std::vector<int64_t> dst_strides = contiguous_strides(shape, elem_bytes);
+  std::vector<int64_t> idx(shape.size(), 0);
+  std::size_t total_elems = 1;
+  for (const auto dim : shape) {
+    if (dim <= 0) return false;
+    total_elems *= static_cast<std::size_t>(dim);
+  }
+
+  for (std::size_t n = 0; n < total_elems; ++n) {
+    std::size_t src_offset = 0;
+    std::size_t dst_offset = 0;
+    for (size_t i = 0; i < idx.size(); ++i) {
+      src_offset += static_cast<std::size_t>(idx[i]) *
+                    static_cast<std::size_t>(src_strides[i]);
+      dst_offset += static_cast<std::size_t>(idx[i]) *
+                    static_cast<std::size_t>(dst_strides[i]);
+    }
+    std::memcpy(dst + dst_offset, src + src_offset, elem_bytes);
+    for (int i = static_cast<int>(idx.size()) - 1; i >= 0; --i) {
+      idx[static_cast<size_t>(i)]++;
+      if (idx[static_cast<size_t>(i)] < shape[static_cast<size_t>(i)]) {
+        break;
+      }
+      idx[static_cast<size_t>(i)] = 0;
+    }
+  }
+  return true;
 }
 
 } // namespace
@@ -266,25 +319,141 @@ NeatTensor NeatTensor::contiguous() const {
 
 NeatTensor NeatTensor::to(NeatDevice target) const {
   if (device.type == target.type && device.id == target.id) return *this;
-  throw std::runtime_error("NeatTensor::to: device transfer not implemented");
+  switch (target.type) {
+    case NeatDeviceType::CPU:
+      return cpu();
+    case NeatDeviceType::SIMA_CVU:
+      return cvu();
+    case NeatDeviceType::SIMA_MLA:
+      return pipeline_internal::transfer_to_device(*this, target, nullptr, nullptr);
+    case NeatDeviceType::SIMA_APU:
+    case NeatDeviceType::UNKNOWN:
+      break;
+  }
+  throw std::runtime_error("NeatTensor::to: unsupported target device");
 }
 
 NeatTensor NeatTensor::cpu() const {
-  return to_cpu_if_needed();
-}
-
-NeatTensor NeatTensor::to_cpu_if_needed() const {
   if (device.type == NeatDeviceType::CPU) {
     if (!storage) {
       throw std::runtime_error("NeatTensor::cpu: missing storage");
     }
-    if (storage->kind == NeatStorageKind::CpuOwned ||
-        storage->kind == NeatStorageKind::CpuExternal ||
-        storage->kind == NeatStorageKind::GstSample) {
+    NeatMapping mapping = map_read();
+    if (mapping.data) {
       return *this;
     }
   }
-  throw std::runtime_error("NeatTensor::cpu: CPU staging not implemented for device tensors");
+  return pipeline_internal::transfer_to_cpu(*this);
+}
+
+NeatTensor NeatTensor::cvu() const {
+  if (device.type == NeatDeviceType::SIMA_CVU) {
+    return *this;
+  }
+  return pipeline_internal::transfer_to_device(
+      *this, {NeatDeviceType::SIMA_CVU, 0}, nullptr, nullptr);
+}
+
+NeatTensor NeatTensor::mla(bool force) const {
+  if (device.type == NeatDeviceType::SIMA_MLA) {
+    return *this;
+  }
+  if (!force && device.type == NeatDeviceType::SIMA_CVU) {
+    return *this;
+  }
+
+  if (!force) {
+    try {
+      return pipeline_internal::transfer_to_device(
+          *this, {NeatDeviceType::SIMA_CVU, 0}, nullptr, nullptr);
+    } catch (const std::exception&) {
+      // Fall back to DMS0.
+    }
+  }
+
+  return pipeline_internal::transfer_to_device(
+      *this, {NeatDeviceType::SIMA_MLA, 0}, nullptr, nullptr);
+}
+
+NeatTensor NeatTensor::to_cpu_if_needed() const {
+  return cpu();
+}
+
+std::size_t NeatTensor::dense_bytes_tight() const {
+  if (!is_dense()) return 0;
+  const std::size_t elem = dtype_bytes(dtype);
+  if (elem == 0) return 0;
+  return dense_size_bytes(shape, elem);
+}
+
+bool NeatTensor::copy_dense_bytes_tight_to(uint8_t* dst, std::size_t dst_size) const {
+  if (!dst) return false;
+  if (!is_dense()) return false;
+  const std::size_t bytes = dense_bytes_tight();
+  if (bytes == 0 || dst_size < bytes) return false;
+
+  NeatMapping mapping = map_read();
+  if (!mapping.data || mapping.size_bytes == 0) return false;
+  if (mapping.size_bytes < bytes) return false;
+
+  const uint8_t* src = static_cast<const uint8_t*>(mapping.data);
+  if (is_contiguous() || strides_bytes.empty()) {
+    std::memcpy(dst, src, bytes);
+    return true;
+  }
+
+  std::vector<int64_t> src_strides = strides_bytes;
+  if (src_strides.size() != shape.size()) {
+    src_strides = contiguous_strides(shape, dtype_bytes(dtype));
+  }
+  return copy_dense_strided(src, mapping.size_bytes, shape, src_strides, dtype_bytes(dtype), dst);
+}
+
+std::vector<uint8_t> NeatTensor::copy_dense_bytes_tight() const {
+  const std::size_t bytes = dense_bytes_tight();
+  if (bytes == 0) {
+    throw std::runtime_error("copy_dense_bytes_tight: unknown dense size");
+  }
+  std::vector<uint8_t> out(bytes);
+  if (!copy_dense_bytes_tight_to(out.data(), out.size())) {
+    throw std::runtime_error("copy_dense_bytes_tight: copy failed");
+  }
+  return out;
+}
+
+bool NeatTensor::copy_payload_bytes_to(uint8_t* dst, std::size_t dst_size) const {
+  if (!dst) return false;
+  if (is_dense()) {
+    const std::size_t bytes = dense_bytes_tight();
+    if (bytes > 0) {
+      return copy_dense_bytes_tight_to(dst, dst_size);
+    }
+  }
+
+  NeatMapping mapping = map_read();
+  if (!mapping.data || mapping.size_bytes == 0) return false;
+  if (dst_size < mapping.size_bytes) return false;
+  std::memcpy(dst, mapping.data, mapping.size_bytes);
+  return true;
+}
+
+std::vector<uint8_t> NeatTensor::copy_payload_bytes() const {
+  const std::size_t dense_bytes = dense_bytes_tight();
+  if (dense_bytes > 0) {
+    std::vector<uint8_t> out(dense_bytes);
+    if (!copy_dense_bytes_tight_to(out.data(), out.size())) {
+      throw std::runtime_error("copy_payload_bytes: dense copy failed");
+    }
+    return out;
+  }
+
+  NeatMapping mapping = map_read();
+  if (!mapping.data || mapping.size_bytes == 0) {
+    throw std::runtime_error("copy_payload_bytes: mapping failed");
+  }
+  std::vector<uint8_t> out(mapping.size_bytes);
+  std::memcpy(out.data(), mapping.data, mapping.size_bytes);
+  return out;
 }
 
 bool NeatTensor::validate(std::string* err) const {
@@ -343,6 +512,19 @@ bool NeatTensor::validate(std::string* err) const {
 
   if (semantic.image.has_value()) {
     const NeatImageSpec::PixelFormat fmt = semantic.image->format;
+    if (fmt == NeatImageSpec::PixelFormat::NV12 ||
+        fmt == NeatImageSpec::PixelFormat::I420) {
+      if (dtype != TensorDType::UInt8) {
+        return fail("NV12/I420 tensors must use UInt8 dtype");
+      }
+      const int w = width();
+      const int h = height();
+      if (w > 0 && h > 0) {
+        if ((w % 2) != 0 || (h % 2) != 0) {
+          return fail("NV12/I420 tensors require even width/height");
+        }
+      }
+    }
     auto has_role = [&](NeatPlaneRole role) {
       for (const auto& plane : planes) {
         if (plane.role == role) return true;

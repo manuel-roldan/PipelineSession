@@ -2,6 +2,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -14,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 
@@ -82,6 +84,16 @@ bool env_string(const char* key, std::string& out) {
   if (!v || !*v) return false;
   out = v;
   return true;
+}
+
+std::string gst_escape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    if (c == '"' || c == '\\') out.push_back('\\');
+    out.push_back(c);
+  }
+  return out;
 }
 
 } // namespace
@@ -377,26 +389,26 @@ cv::Mat load_rgb_resized(const std::string& image_path, int w, int h) {
   return rgb;
 }
 
-std::vector<float> tensor_to_floats(const sima::FrameTensor& t) {
+std::vector<float> tensor_to_floats(const sima::NeatTensor& t) {
   if (t.dtype != sima::TensorDType::Float32) {
     throw std::runtime_error("Expected Float32 tensor output");
   }
-  if (t.planes.empty() || t.planes[0].empty()) {
+  std::vector<uint8_t> raw = t.copy_dense_bytes_tight();
+  if (raw.empty()) {
     throw std::runtime_error("Tensor output is empty");
   }
-
-  const size_t bytes = t.planes[0].size();
+  const size_t bytes = raw.size();
   if (bytes % sizeof(float) != 0) {
     throw std::runtime_error("Tensor plane size is not a multiple of float");
   }
 
   const size_t elems = bytes / sizeof(float);
   std::vector<float> out(elems);
-  std::memcpy(out.data(), t.planes[0].data(), elems * sizeof(float));
+  std::memcpy(out.data(), raw.data(), elems * sizeof(float));
   return out;
 }
 
-std::vector<float> scores_from_tensor(const sima::FrameTensor& t,
+std::vector<float> scores_from_tensor(const sima::NeatTensor& t,
                                       const std::string& label) {
   auto scores_full = tensor_to_floats(t);
   if (scores_full.empty()) {
@@ -468,15 +480,54 @@ void check_top1(const std::vector<float>& scores,
             << expected_id << "\n";
 }
 
-sima::FrameTensor pull_tensor_with_retry(sima::TensorStream& ts,
-                                         const std::string& label,
-                                         int per_try_ms,
-                                         int tries) {
+sima::NeatTensor pull_tensor_with_retry(sima::TensorStream& ts,
+                                        const std::string& label,
+                                        int per_try_ms,
+                                        int tries) {
   for (int i = 0; i < tries; ++i) {
     auto t = ts.next_copy(per_try_ms);
     if (t.has_value()) return *t;
   }
   throw std::runtime_error(label + ": no tensor received (timeout/EOS)");
+}
+
+std::string h264_gst_pipeline(const fs::path& out_path,
+                              int width,
+                              int height,
+                              double fps,
+                              int bitrate_kbps) {
+  const int fps_i = (fps > 0.0) ? static_cast<int>(fps + 0.5) : 30;
+  std::ostringstream ss;
+  ss << "appsrc ! videoconvert ! video/x-raw,format=I420"
+     << ",width=" << width
+     << ",height=" << height
+     << ",framerate=" << fps_i << "/1"
+     << " ! x264enc speed-preset=ultrafast tune=zerolatency bitrate=" << bitrate_kbps
+     << " key-int-max=" << fps_i
+     << " ! h264parse ! mp4mux ! filesink location=\""
+     << gst_escape(out_path.string()) << "\"";
+  return ss.str();
+}
+
+bool open_h264_writer(cv::VideoWriter& writer,
+                      const fs::path& out_path,
+                      int width,
+                      int height,
+                      double fps,
+                      int bitrate_kbps,
+                      std::string* err) {
+  if (width <= 0 || height <= 0) {
+    if (err) *err = "invalid width/height for video writer";
+    return false;
+  }
+  const double use_fps = (fps > 0.0) ? fps : 30.0;
+  const std::string pipeline = h264_gst_pipeline(out_path, width, height, use_fps, bitrate_kbps);
+  writer.open(pipeline, cv::CAP_GSTREAMER, 0, use_fps, cv::Size(width, height), true);
+  if (!writer.isOpened()) {
+    if (err) *err = "failed to open H264 writer";
+    return false;
+  }
+  return true;
 }
 
 } // namespace sima_examples

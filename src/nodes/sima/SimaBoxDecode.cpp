@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -141,7 +142,18 @@ bool copy_number_if_present(json& dst,
 
 void apply_overrides(json& j, const BoxDecodeOptionsInternal& opt) {
   if (!opt.decode_type.empty()) j["decode_type"] = opt.decode_type;
-  if (opt.top_k > 0) j["topk"] = opt.top_k;
+  if (opt.top_k > 0) {
+    j["topk"] = opt.top_k;
+    if (!j.contains("buffers") || !j["buffers"].is_object()) {
+      j["buffers"] = json::object();
+    }
+    if (!j["buffers"].contains("output") || !j["buffers"]["output"].is_object()) {
+      j["buffers"]["output"] = json::object();
+    }
+    const std::size_t out_size =
+        sizeof(std::uint32_t) + static_cast<std::size_t>(opt.top_k) * 24;
+    j["buffers"]["output"]["size"] = out_size;
+  }
   if (opt.num_classes > 0) j["num_classes"] = opt.num_classes;
   if (opt.detection_threshold > 0.0) j["detection_threshold"] = opt.detection_threshold;
   if (opt.nms_iou_threshold > 0.0) j["nms_iou_threshold"] = opt.nms_iou_threshold;

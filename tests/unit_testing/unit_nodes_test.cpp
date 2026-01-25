@@ -19,11 +19,16 @@
 
 #include "test_utils.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+static const char* decoder_element_name() {
+  return "neatdecoder";
+}
 
 int main() {
   try {
@@ -62,10 +67,11 @@ int main() {
     require_contains(depay->gst_fragment(2), "payload=97", "Depay payload mismatch");
 
     auto dec = sima::nodes::H264Decode(2, "NV12");
-    require_contains(dec->gst_fragment(1), "simaaidecoder name=n1_decoder", "Decode fragment mismatch");
+    const std::string dec_expect = std::string(decoder_element_name()) + " name=n1_decoder";
+    require_contains(dec->gst_fragment(1), dec_expect, "Decode fragment mismatch");
 
     auto enc = sima::nodes::H264EncodeSima(64, 64, 30, 400, "baseline", "4.0");
-    require_contains(enc->gst_fragment(0), "simaaiencoder name=n0_encoder", "Encode fragment mismatch");
+    require_contains(enc->gst_fragment(0), "neatencoder name=n0_encoder", "Encode fragment mismatch");
 
     sima::H264ParseOptions opt;
     opt.enforce_caps = true;

@@ -217,7 +217,7 @@ void step_log(const char* label) {
   std::cout << "[STEP] " << label << std::endl;
 }
 
-bool extract_bbox_payload(const sima::RunInputResult& result,
+bool extract_bbox_payload(const sima::RunOutput& result,
                           std::vector<uint8_t>& payload,
                           std::string& err) {
   if (result.kind != sima::RunOutputKind::Tensor) {
@@ -226,40 +226,19 @@ bool extract_bbox_payload(const sima::RunInputResult& result,
   }
   if (result.neat.has_value()) {
     const auto& tensor = result.neat.value();
-    const std::string fmt = !result.format.empty()
-        ? upper_copy(result.format)
+    const std::string fmt = !result.payload_tag.empty()
+        ? upper_copy(result.payload_tag)
         : neat_format(tensor);
     if (!fmt.empty() && fmt != "BBOX") {
       err = "capture_expected_bbox format=" + fmt;
       return false;
     }
-    if (!tensor.storage) {
-      err = "capture_missing_storage";
+    try {
+      payload = tensor.copy_payload_bytes();
+    } catch (const std::exception& ex) {
+      err = std::string("capture_payload_failed err=") + ex.what();
       return false;
     }
-    sima::NeatMapping mapping = tensor.map(sima::NeatMapMode::Read);
-    if (!mapping.data) {
-      err = "capture_missing_mapping";
-      return false;
-    }
-    size_t bytes = 0;
-    if (!tensor.shape.empty()) {
-      bytes = neat_dtype_bytes(tensor.dtype);
-      for (auto dim : tensor.shape) {
-        if (dim <= 0) {
-          bytes = 0;
-          break;
-        }
-        bytes *= static_cast<size_t>(dim);
-      }
-    }
-    if (bytes == 0) bytes = mapping.size_bytes;
-    if (bytes > mapping.size_bytes) {
-      err = "capture_size_mismatch";
-      return false;
-    }
-    payload.assign(static_cast<const uint8_t*>(mapping.data),
-                   static_cast<const uint8_t*>(mapping.data) + bytes);
   } else {
     err = "capture_missing_tensor";
     return false;
@@ -360,7 +339,7 @@ void run_preproc_pipeline_once(const cv::Mat& img_bgr,
   p.add(sima::nodes::OutputAppSink());
 
   step_log("preproc_pipeline: before p.run");
-  const sima::RunInputResult out = p.run(wire);
+  const sima::RunOutput out = p.run(wire);
   step_log("preproc_pipeline: after p.run");
   std::vector<uint8_t> payload;
   std::string err;

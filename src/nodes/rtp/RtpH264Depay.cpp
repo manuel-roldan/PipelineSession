@@ -11,12 +11,14 @@ RtpH264Depay::RtpH264Depay(int payload_type,
                            int h264_parse_config_interval,
                            int h264_fps,
                            int h264_width,
-                           int h264_height)
+                           int h264_height,
+                           bool enforce_h264_caps)
     : payload_type_(payload_type),
       h264_parse_config_interval_(h264_parse_config_interval),
       h264_fps_(h264_fps),
       h264_width_(h264_width),
-      h264_height_(h264_height) {}
+      h264_height_(h264_height),
+      enforce_h264_caps_(enforce_h264_caps) {}
 
 std::string RtpH264Depay::gst_fragment(int node_index) const {
   const std::string rtp = "n" + std::to_string(node_index) + "_rtp_caps";
@@ -38,13 +40,15 @@ std::string RtpH264Depay::gst_fragment(int node_index) const {
   }
   ss << "! capsfilter name=" << hcc
      << " caps=\"video/x-h264,parsed=true,stream-format=(string)byte-stream,alignment=(string)au";
-  if (h264_width_ > 0 && h264_height_ > 0) {
-    ss << ",width=(int)" << h264_width_ << ",height=(int)" << h264_height_;
-  } else {
-    ss << ",width=(int)[1,4096],height=(int)[1,4096]";
-  }
-  if (h264_fps_ > 0) {
-    ss << ",framerate=(fraction)" << h264_fps_ << "/1";
+  if (enforce_h264_caps_) {
+    if (h264_width_ > 0 && h264_height_ > 0) {
+      ss << ",width=(int)" << h264_width_ << ",height=(int)" << h264_height_;
+    } else {
+      ss << ",width=(int)[1,4096],height=(int)[1,4096]";
+    }
+    if (h264_fps_ > 0) {
+      ss << ",framerate=(fraction)" << h264_fps_ << "/1";
+    }
   }
   ss << "\"";
   return ss.str();
@@ -76,18 +80,30 @@ std::shared_ptr<sima::Node> RtpH264Depay(int payload_type,
                                          int h264_parse_config_interval,
                                          int h264_fps,
                                          int h264_width,
-                                         int h264_height) {
+                                         int h264_height,
+                                         bool enforce_h264_caps) {
   return std::make_shared<sima::RtpH264Depay>(
-      payload_type, h264_parse_config_interval, h264_fps, h264_width, h264_height);
+      payload_type,
+      h264_parse_config_interval,
+      h264_fps,
+      h264_width,
+      h264_height,
+      enforce_h264_caps);
 }
 
 std::shared_ptr<sima::Node> H264DepayParse(int payload_type,
                                            int h264_parse_config_interval,
                                            int h264_fps,
                                            int h264_width,
-                                           int h264_height) {
+                                           int h264_height,
+                                           bool enforce_h264_caps) {
   return std::make_shared<sima::RtpH264Depay>(
-      payload_type, h264_parse_config_interval, h264_fps, h264_width, h264_height);
+      payload_type,
+      h264_parse_config_interval,
+      h264_fps,
+      h264_width,
+      h264_height,
+      enforce_h264_caps);
 }
 
 } // namespace sima::nodes

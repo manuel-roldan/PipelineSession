@@ -21,9 +21,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -46,6 +48,39 @@ struct RunSummary {
   double avg_fps = 0.0;
   std::string note;
 };
+
+std::string hex_prefix(const std::vector<uint8_t>& payload, size_t max_bytes) {
+  std::ostringstream ss;
+  ss << std::hex << std::setfill('0');
+  const size_t count = std::min(payload.size(), max_bytes);
+  for (size_t i = 0; i < count; ++i) {
+    ss << std::setw(2) << static_cast<int>(payload[i]);
+    if (i + 1 < count) ss << " ";
+  }
+  return ss.str();
+}
+
+std::string bbox_payload_summary(const std::vector<uint8_t>& payload,
+                                 int expected_topk) {
+  std::ostringstream ss;
+  ss << "bytes=" << payload.size();
+  if (payload.size() >= sizeof(uint32_t)) {
+    uint32_t header = 0;
+    std::memcpy(&header, payload.data(), sizeof(header));
+    const size_t data_bytes = payload.size() - sizeof(uint32_t);
+    const size_t max_boxes = data_bytes / 24;
+    ss << " header=" << header
+       << " data_bytes=" << data_bytes
+       << " data_rem=" << (data_bytes % 24)
+       << " max_boxes=" << max_boxes;
+    if (expected_topk > 0) {
+      const size_t expected_bytes = sizeof(uint32_t) +
+          static_cast<size_t>(expected_topk) * 24;
+      ss << " expected_bytes=" << expected_bytes;
+    }
+  }
+  return ss.str();
+}
 
 void step_log(const char* label) {
   std::cout << "[STEP] " << label << std::endl;
@@ -70,31 +105,35 @@ bool pull_with_timeout(sima::PipelineRun& async,
                        int pull_timeout_ms,
                        int max_timeouts,
                        int& timeout_count,
-                       std::optional<sima::RunInputResult>& out,
+                       std::optional<sima::RunOutput>& out,
                        std::string& err) {
   while (true) {
-    try {
-      out = async.pull(pull_timeout_ms);
+    sima::RunOutput temp;
+    sima::PullError perr;
+    const sima::PullStatus status = async.pull(pull_timeout_ms, temp, &perr);
+    if (status == sima::PullStatus::Ok) {
+      out = temp;
       timeout_count = 0;
       return true;
-    } catch (const std::exception& e) {
-      const std::string msg = e.what();
-      if (pull_timeout_ms >= 0 &&
-          msg.find("timeout waiting for output") != std::string::npos) {
-        timeout_count += 1;
-        if (max_timeouts > 0 && timeout_count >= max_timeouts) {
-          err = msg;
-          return false;
-        }
-        continue;
+    }
+    if (status == sima::PullStatus::Timeout) {
+      timeout_count += 1;
+      if (max_timeouts > 0 && timeout_count >= max_timeouts) {
+        err = "PipelineRun::pull: timeout";
+        return false;
       }
-      err = msg;
+      continue;
+    }
+    if (status == sima::PullStatus::Closed) {
+      err = "PipelineRun::pull: closed";
       return false;
     }
+    err = perr.message.empty() ? "PipelineRun::pull: error" : perr.message;
+    return false;
   }
 }
 
-bool extract_bbox_payload(const sima::RunInputResult& result,
+bool extract_bbox_payload(const sima::RunOutput& result,
                           int iter,
                           std::vector<uint8_t>& payload,
                           std::string& err) {
@@ -104,7 +143,7 @@ bool extract_bbox_payload(const sima::RunInputResult& result,
   }
   if (result.neat.has_value()) {
     const auto& tensor = result.neat.value();
-    std::string fmt = result.format;
+    std::string fmt = result.payload_tag;
     if (fmt.empty() && tensor.semantic.tess.has_value()) {
       fmt = tensor.semantic.tess->format;
     }
@@ -113,40 +152,12 @@ bool extract_bbox_payload(const sima::RunInputResult& result,
             " format=" + fmt;
       return false;
     }
-    sima::NeatMapping mapping = tensor.map(sima::NeatMapMode::Read);
-    if (!mapping.data) {
-      err = "capture_missing_mapping iter=" + std::to_string(iter);
+    try {
+      payload = tensor.copy_payload_bytes();
+    } catch (const std::exception& ex) {
+      err = "capture_payload_failed iter=" + std::to_string(iter) + " err=" + ex.what();
       return false;
     }
-    size_t bytes = 0;
-    if (!tensor.shape.empty()) {
-      size_t elem = 1;
-      switch (tensor.dtype) {
-        case sima::TensorDType::UInt8: elem = 1; break;
-        case sima::TensorDType::Int8: elem = 1; break;
-        case sima::TensorDType::UInt16: elem = 2; break;
-        case sima::TensorDType::Int16: elem = 2; break;
-        case sima::TensorDType::Int32: elem = 4; break;
-        case sima::TensorDType::BFloat16: elem = 2; break;
-        case sima::TensorDType::Float32: elem = 4; break;
-        case sima::TensorDType::Float64: elem = 8; break;
-      }
-      bytes = elem;
-      for (auto dim : tensor.shape) {
-        if (dim <= 0) {
-          bytes = 0;
-          break;
-        }
-        bytes *= static_cast<size_t>(dim);
-      }
-    }
-    if (bytes == 0) bytes = mapping.size_bytes;
-    if (bytes > mapping.size_bytes) {
-      err = "capture_size_mismatch iter=" + std::to_string(iter);
-      return false;
-    }
-    payload.assign(static_cast<const uint8_t*>(mapping.data),
-                   static_cast<const uint8_t*>(mapping.data) + bytes);
   } else {
     err = "capture_missing_tensor iter=" + std::to_string(iter);
     return false;
@@ -239,7 +250,7 @@ RunSummary run_yolov8_async_tput(const fs::path& root,
     int timeout_count = 0;
     try {
       while (true) {
-        std::optional<sima::RunInputResult> out;
+        std::optional<sima::RunOutput> out;
         std::string err;
         if (!pull_with_timeout(async,
                                pull_timeout_ms,
@@ -302,8 +313,20 @@ RunSummary run_yolov8_async_tput(const fs::path& root,
   }
   const size_t verify_count = std::min(payloads, static_cast<size_t>(cfg.iters));
   for (size_t i = 0; i < verify_count; ++i) {
-    const auto boxes = objdet::parse_boxes_strict(
-        verify_payloads[i], img.cols, img.rows, topk, false);
+    std::vector<objdet::Box> boxes;
+    try {
+      boxes = objdet::parse_boxes_strict(
+          verify_payloads[i], img.cols, img.rows, topk, false);
+    } catch (const std::exception& ex) {
+      std::cerr << "[WARN] bbox parse failed iter=" << i
+                << " err=" << ex.what()
+                << " " << bbox_payload_summary(verify_payloads[i], topk)
+                << " prefix=" << hex_prefix(verify_payloads[i], 64)
+                << "\n";
+      append_note(res.note, "bbox_parse_failed iter=" + std::to_string(i));
+      res.ok = false;
+      break;
+    }
     const objdet::MatchResult match = objdet::match_expected_boxes(
         boxes, expected, cfg.min_score, cfg.min_iou);
     if (!match.ok) {

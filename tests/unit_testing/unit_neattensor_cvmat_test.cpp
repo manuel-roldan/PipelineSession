@@ -25,9 +25,13 @@ int main() {
     require(t.shape[0] == 2 && t.shape[1] == 2 && t.shape[2] == 3, "shape mismatch");
     require(!t.is_contiguous(), "ROI view should be non-contiguous");
 
-    auto map = t.map(sima::NeatMapMode::Read);
-    require(map.data != nullptr, "mapping failed");
-    require(map.data == view.data, "expected zero-copy ROI mapping");
+    auto v = t.map_cv_mat_view(sima::NeatImageSpec::PixelFormat::BGR);
+    require(v.has_value(), "map_cv_mat_view failed");
+    require(v->mat.data == view.data, "expected zero-copy ROI view");
+    const cv::Vec3b px = v->mat.at<cv::Vec3b>(0, 0);
+    require(px[0] == 1 && px[1] == 2 && px[2] == 3, "view pixel mismatch");
+    cv::Mat clone = v->mat.clone();
+    require(clone.rows == view.rows && clone.cols == view.cols, "clone shape mismatch");
 
     std::cout << "[OK] unit_neattensor_cvmat_test passed\n";
     return 0;

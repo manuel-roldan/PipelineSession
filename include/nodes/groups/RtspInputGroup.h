@@ -17,6 +17,10 @@ struct RtspInputGroupOptions {
   int h264_width = -1;
   int h264_height = -1;
   bool insert_queue = true;
+  bool auto_caps_from_stream = true;
+  int fallback_h264_fps = 30;
+  int fallback_h264_width = 1280;
+  int fallback_h264_height = 720;
 
   int sima_allocator_type = 2;
   std::string out_format = "NV12";

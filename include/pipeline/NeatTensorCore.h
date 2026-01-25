@@ -12,6 +12,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(SIMA_WITH_OPENCV)
+#include <opencv2/core.hpp>
+#endif
+
 namespace sima {
 
 enum class NeatDeviceType {
@@ -125,6 +129,18 @@ struct NeatMapping {
   }
 };
 
+#if defined(SIMA_WITH_OPENCV)
+struct NeatCvMatView {
+  NeatMapping mapping;
+  cv::Mat mat;
+};
+#endif
+
+struct NeatSegment {
+  std::string name;
+  std::size_t size_bytes = 0;
+};
+
 struct NeatStorage {
   NeatStorageKind kind = NeatStorageKind::Unknown;
   NeatDevice device{};
@@ -132,6 +148,9 @@ struct NeatStorage {
   std::shared_ptr<void> holder;
   void* data = nullptr;
   std::function<NeatMapping(NeatMapMode)> map_fn;
+  std::uint64_t sima_mem_target_flags = 0;
+  std::uint64_t sima_mem_flags = 0;
+  std::vector<NeatSegment> sima_segments;
 
   NeatMapping map(NeatMapMode mode) const {
     NeatMapping mapping;
@@ -173,6 +192,22 @@ struct NeatNv12View {
 struct NeatNv12Mapped {
   NeatMapping mapping;
   NeatNv12View view;
+};
+
+struct NeatI420View {
+  int width = 0;
+  int height = 0;
+  const uint8_t* y = nullptr;
+  int64_t y_stride = 0;
+  const uint8_t* u = nullptr;
+  int64_t u_stride = 0;
+  const uint8_t* v = nullptr;
+  int64_t v_stride = 0;
+};
+
+struct NeatI420Mapped {
+  NeatMapping mapping;
+  NeatI420View view;
 };
 
 struct NeatTensor {
@@ -266,6 +301,8 @@ struct NeatTensor {
   NeatTensor clone() const;
   NeatTensor to(NeatDevice target) const;
   NeatTensor cpu() const;
+  NeatTensor cvu() const;
+  NeatTensor mla(bool force = false) const;
   NeatTensor to_cpu_if_needed() const;
   bool validate(std::string* err) const;
 
@@ -273,6 +310,18 @@ struct NeatTensor {
   std::size_t nv12_required_bytes() const;
   bool copy_nv12_contiguous_to(uint8_t* dst, std::size_t dst_size) const;
   std::vector<uint8_t> copy_nv12_contiguous() const;
+
+  std::optional<NeatI420Mapped> map_i420_read() const;
+  std::size_t i420_required_bytes() const;
+  bool copy_i420_contiguous_to(uint8_t* dst, std::size_t dst_size) const;
+  std::vector<uint8_t> copy_i420_contiguous() const;
+
+  std::size_t dense_bytes_tight() const;
+  bool copy_dense_bytes_tight_to(uint8_t* dst, std::size_t dst_size) const;
+  std::vector<uint8_t> copy_dense_bytes_tight() const;
+
+  bool copy_payload_bytes_to(uint8_t* dst, std::size_t dst_size) const;
+  std::vector<uint8_t> copy_payload_bytes() const;
 
   int width() const;
   int height() const;
@@ -282,6 +331,15 @@ struct NeatTensor {
   bool is_i420() const;
 
   std::string debug_string() const;
+
+#if defined(SIMA_WITH_OPENCV)
+  static NeatTensor from_cv_mat(
+      const cv::Mat& mat,
+      NeatImageSpec::PixelFormat fmt = NeatImageSpec::PixelFormat::BGR,
+      bool read_only = true);
+  std::optional<NeatCvMatView> map_cv_mat_view(NeatImageSpec::PixelFormat desired) const;
+  cv::Mat to_cv_mat_copy(NeatImageSpec::PixelFormat desired) const;
+#endif
 
 private:
   template <typename T>

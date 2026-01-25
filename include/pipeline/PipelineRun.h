@@ -112,11 +112,18 @@ public:
   bool try_push(const cv::Mat& input);
   bool push(const NeatTensor& input);
   bool try_push(const NeatTensor& input);
+  bool push(const RunOutput& msg);
+  bool try_push(const RunOutput& msg);
   // Internal: pushes a GstBuffer held by a tensor ref to preserve plugin metadata.
   bool push_holder(const std::shared_ptr<void>& holder);
   bool try_push_holder(const std::shared_ptr<void>& holder);
   void close_input();
+  PullStatus pull(int timeout_ms, RunOutput& out, PullError* err = nullptr);
   std::optional<RunInputResult> pull(int timeout_ms = -1);
+  std::optional<NeatTensor> pull_neat(int timeout_ms = -1);
+  NeatTensor pull_neat_or_throw(int timeout_ms = -1);
+  std::optional<NeatTensor> pull_neat_matching(const std::string& payload_tag,
+                                               int timeout_ms = -1);
   RunInputResult push_and_pull(const cv::Mat& input, int timeout_ms = -1);
   RunInputResult push_and_pull(const NeatTensor& input, int timeout_ms = -1);
   RunInputResult push_and_pull_holder(const std::shared_ptr<void>& holder, int timeout_ms = -1);
@@ -140,6 +147,7 @@ private:
   bool push_impl(const cv::Mat& input, bool block);
   bool push_impl(const NeatTensor& input, bool block);
   bool push_holder_impl(const std::shared_ptr<void>& holder, bool block);
+  bool push_message_impl(const RunOutput& msg, bool block);
   static PipelineRun create(InputStream stream,
                             const PipelineRunOptions& opt,
                             const struct InputStreamOptions& stream_opt);

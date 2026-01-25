@@ -28,18 +28,22 @@
 #include "contracts/Validators.h"
 #include "pipeline/NeatTensor.h"
 #include "pipeline/NeatTensorAdapters.h"
+#include "nodes/io/RTSPInput.h"
+#include "nodes/rtp/H264CapsFixup.h"
 
 #include <gst/gst.h>
 #include <gst/gstdebugutils.h>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/rtsp-server/rtsp-server.h>
+#include <gst/sdp/sdp.h>
 #include <gst/video/video.h>
 #include <glib.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cctype>
@@ -998,6 +1002,369 @@ static void attach_stage_timing_probes(GstElement* pipeline,
   }
   g_value_unset(&item);
   gst_iterator_free(it);
+}
+
+static int parse_sdp_fps_value(const char* value) {
+  if (!value || !*value) return 0;
+  char* end = nullptr;
+  const double num = std::strtod(value, &end);
+  if (end == value) return 0;
+  double fps = num;
+  if (*end == '/') {
+    char* end_den = nullptr;
+    const double den = std::strtod(end + 1, &end_den);
+    if (end_den != end + 1 && den > 0.0) {
+      fps = num / den;
+    }
+  }
+  if (fps <= 0.0) return 0;
+  const double rounded = std::round(fps);
+  if (std::fabs(fps - rounded) > 0.1) return 0;
+  return static_cast<int>(rounded);
+}
+
+static int parse_sdp_fps(const GstSDPMessage* sdp) {
+  if (!sdp) return 0;
+  const char* session_fps = gst_sdp_message_get_attribute_val(sdp, "framerate");
+  int fps = parse_sdp_fps_value(session_fps);
+  if (fps > 0) return fps;
+
+  const guint media_count = gst_sdp_message_medias_len(sdp);
+  for (guint i = 0; i < media_count; ++i) {
+    const GstSDPMedia* media = gst_sdp_message_get_media(sdp, i);
+    if (!media) continue;
+    const char* media_type = gst_sdp_media_get_media(media);
+    if (media_type && std::strcmp(media_type, "video") != 0) continue;
+    const char* media_fps = gst_sdp_media_get_attribute_val(media, "framerate");
+    fps = parse_sdp_fps_value(media_fps);
+    if (fps > 0) return fps;
+  }
+
+  return 0;
+}
+
+struct H264CapsFixupCtx {
+  std::string element_name;
+  std::string rtsp_element_name;
+  int fallback_fps = 30;
+  int fallback_width = 1280;
+  int fallback_height = 720;
+  std::atomic<int> sdp_fps{0};
+  bool logged = false;
+  bool error_reported = false;
+};
+
+static void h264_caps_fixup_on_sdp(GstElement* /*src*/,
+                                   GstSDPMessage* sdp,
+                                   gpointer user_data) {
+  auto* ctx = reinterpret_cast<H264CapsFixupCtx*>(user_data);
+  if (!ctx || !sdp) return;
+  const int fps = parse_sdp_fps(sdp);
+  if (fps <= 0) return;
+  int expected = 0;
+  ctx->sdp_fps.compare_exchange_strong(expected, fps);
+}
+
+static bool h264_caps_fixup_apply(GstPad* pad,
+                                  GstStructure* s,
+                                  H264CapsFixupCtx* ctx,
+                                  bool* out_changed,
+                                  int* out_log_fps,
+                                  const char** out_log_source) {
+  if (!s || !ctx) return false;
+
+  bool changed = false;
+  const char* fps_source = nullptr;
+  int applied_fps = 0;
+
+  int width = 0;
+  if (!gst_structure_get_int(s, "width", &width) || width <= 0) {
+    if (ctx->fallback_width > 0) {
+      gst_structure_set(s, "width", G_TYPE_INT, ctx->fallback_width, nullptr);
+      changed = true;
+    }
+  }
+
+  int height = 0;
+  if (!gst_structure_get_int(s, "height", &height) || height <= 0) {
+    if (ctx->fallback_height > 0) {
+      gst_structure_set(s, "height", G_TYPE_INT, ctx->fallback_height, nullptr);
+      changed = true;
+    }
+  }
+
+  int num = 0;
+  int den = 0;
+  const bool has_fps =
+      gst_structure_get_fraction(s, "framerate", &num, &den) && den == 1 && num > 0;
+  if (!has_fps) {
+    applied_fps = ctx->sdp_fps.load();
+    if (applied_fps > 0) {
+      fps_source = "sdp";
+    } else if (ctx->fallback_fps > 0) {
+      applied_fps = ctx->fallback_fps;
+      fps_source = "fallback";
+    }
+    if (applied_fps <= 0) {
+      if (!ctx->error_reported) {
+        ctx->error_reported = true;
+        GstElement* elem = pad ? gst_pad_get_parent_element(pad) : nullptr;
+        if (elem) {
+          GST_ELEMENT_ERROR(elem,
+                            CORE,
+                            NEGOTIATION,
+                            ("neatdecoder requires framerate in caps."),
+                            (nullptr));
+          gst_object_unref(elem);
+        }
+      }
+      return false;
+    }
+    gst_structure_set(s, "framerate", GST_TYPE_FRACTION, applied_fps, 1, nullptr);
+    changed = true;
+  }
+
+  if (out_changed) *out_changed = changed;
+  if (out_log_fps) *out_log_fps = has_fps ? num : applied_fps;
+  if (out_log_source) {
+    *out_log_source = fps_source ? fps_source : (has_fps ? "caps" : "fallback");
+  }
+  return true;
+}
+
+static GstPadProbeReturn h264_caps_fixup_cb(GstPad* pad,
+                                            GstPadProbeInfo* info,
+                                            gpointer user_data) {
+  auto* ctx = reinterpret_cast<H264CapsFixupCtx*>(user_data);
+  if (!ctx) return GST_PAD_PROBE_OK;
+
+  if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM) != 0) {
+    GstQuery* query = GST_PAD_PROBE_INFO_QUERY(info);
+    if (!query || GST_QUERY_TYPE(query) != GST_QUERY_ACCEPT_CAPS) {
+      return GST_PAD_PROBE_OK;
+    }
+
+    GstCaps* caps = nullptr;
+    gst_query_parse_accept_caps(query, &caps);
+    if (!caps || gst_caps_get_size(caps) < 1) return GST_PAD_PROBE_OK;
+
+    GstCaps* new_caps = gst_caps_copy(caps);
+    GstStructure* s = gst_caps_get_structure(new_caps, 0);
+    if (!s) {
+      gst_caps_unref(new_caps);
+      return GST_PAD_PROBE_OK;
+    }
+
+    const char* media = gst_structure_get_name(s);
+    if (!media || std::strcmp(media, "video/x-h264") != 0) {
+      gst_caps_unref(new_caps);
+      return GST_PAD_PROBE_OK;
+    }
+
+    bool changed = false;
+    int log_fps = 0;
+    const char* log_source = nullptr;
+    if (!h264_caps_fixup_apply(pad, s, ctx, &changed, &log_fps, &log_source)) {
+      gst_caps_unref(new_caps);
+      return GST_PAD_PROBE_OK;
+    }
+
+    if (!changed) {
+      gst_caps_unref(new_caps);
+      return GST_PAD_PROBE_OK;
+    }
+
+    if (!ctx->logged) {
+      int log_width = 0;
+      int log_height = 0;
+      gst_structure_get_int(s, "width", &log_width);
+      gst_structure_get_int(s, "height", &log_height);
+      std::fprintf(stderr,
+                   "[rtsp] %s: H264 caps missing fields; applying %dx%d@%d (%s)\n",
+                   ctx->element_name.c_str(),
+                   log_width,
+                   log_height,
+                   log_fps,
+                   log_source);
+      ctx->logged = true;
+    }
+
+    GstQuery* new_query = gst_query_new_accept_caps(new_caps);
+    gboolean ok = gst_pad_peer_query(pad, new_query);
+    gboolean result = FALSE;
+    if (ok) {
+      gst_query_parse_accept_caps_result(new_query, &result);
+    }
+    gst_query_set_accept_caps_result(query, result);
+    gst_query_unref(new_query);
+    gst_caps_unref(new_caps);
+    return GST_PAD_PROBE_HANDLED;
+  }
+
+  if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) == 0)
+    return GST_PAD_PROBE_OK;
+
+  GstEvent* ev = GST_PAD_PROBE_INFO_EVENT(info);
+  if (!ev || GST_EVENT_TYPE(ev) != GST_EVENT_CAPS) return GST_PAD_PROBE_OK;
+
+  GstCaps* caps = nullptr;
+  gst_event_parse_caps(ev, &caps);
+  if (!caps || gst_caps_get_size(caps) < 1) return GST_PAD_PROBE_OK;
+
+  GstCaps* new_caps = gst_caps_copy(caps);
+  GstStructure* s = gst_caps_get_structure(new_caps, 0);
+  if (!s) {
+    gst_caps_unref(new_caps);
+    return GST_PAD_PROBE_OK;
+  }
+
+  const char* media = gst_structure_get_name(s);
+  if (!media || std::strcmp(media, "video/x-h264") != 0) {
+    gst_caps_unref(new_caps);
+    return GST_PAD_PROBE_OK;
+  }
+
+  bool changed = false;
+  int log_fps = 0;
+  const char* log_source = nullptr;
+  if (!h264_caps_fixup_apply(pad, s, ctx, &changed, &log_fps, &log_source)) {
+    gst_caps_unref(new_caps);
+    gst_event_unref(ev);
+    return GST_PAD_PROBE_DROP;
+  }
+
+  if (!changed) {
+    gst_caps_unref(new_caps);
+    return GST_PAD_PROBE_OK;
+  }
+
+  if (!ctx->logged) {
+    int log_width = 0;
+    int log_height = 0;
+    gst_structure_get_int(s, "width", &log_width);
+    gst_structure_get_int(s, "height", &log_height);
+    std::fprintf(stderr,
+                 "[rtsp] %s: H264 caps missing fields; applying %dx%d@%d (%s)\n",
+                 ctx->element_name.c_str(),
+                 log_width,
+                 log_height,
+                 log_fps,
+                 log_source);
+    ctx->logged = true;
+  }
+
+  GstEvent* new_ev = gst_event_new_caps(new_caps);
+  gst_caps_unref(new_caps);
+  gst_event_unref(ev);
+  GST_PAD_PROBE_INFO_DATA(info) = new_ev;
+  return GST_PAD_PROBE_OK;
+}
+
+static std::string find_rtsp_input_name_for_fixup(
+    const std::vector<std::shared_ptr<Node>>& nodes,
+    size_t fixup_index) {
+  if (fixup_index == 0) return {};
+  for (size_t i = fixup_index; i-- > 0;) {
+    const auto* rtsp = dynamic_cast<const RTSPInput*>(nodes[i].get());
+    if (!rtsp) continue;
+    const auto names = nodes[i]->element_names(static_cast<int>(i));
+    if (!names.empty()) return names[0];
+  }
+  return {};
+}
+
+static std::string find_h264_capsfilter_name_for_fixup(
+    const std::vector<std::shared_ptr<Node>>& nodes,
+    size_t fixup_index) {
+  if (fixup_index == 0) return {};
+  for (size_t i = fixup_index; i-- > 0;) {
+    if (nodes[i]->kind() != "RtpH264Depay") continue;
+    const auto names = nodes[i]->element_names(static_cast<int>(i));
+    if (!names.empty()) return names.back();
+  }
+  return {};
+}
+
+static H264CapsFixupCtx* make_h264_caps_fixup_ctx(GstElement* pipeline,
+                                                  const H264CapsFixup& fix,
+                                                  const std::string& element_name,
+                                                  const std::string& rtsp_element_name) {
+  auto* ctx = new H264CapsFixupCtx();
+  ctx->element_name = element_name;
+  ctx->fallback_fps = fix.fallback_fps();
+  ctx->fallback_width = fix.fallback_width();
+  ctx->fallback_height = fix.fallback_height();
+  ctx->rtsp_element_name = rtsp_element_name;
+  if (!ctx->rtsp_element_name.empty()) {
+    GstElement* rtspsrc = gst_bin_get_by_name(GST_BIN(pipeline),
+                                              ctx->rtsp_element_name.c_str());
+    if (rtspsrc) {
+      g_signal_connect(rtspsrc, "on-sdp", G_CALLBACK(h264_caps_fixup_on_sdp), ctx);
+      gst_object_unref(rtspsrc);
+    }
+  }
+  return ctx;
+}
+
+static void attach_h264_caps_fixups(GstElement* pipeline,
+                                    const std::vector<std::shared_ptr<Node>>& nodes) {
+  if (!pipeline) return;
+
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    const auto* fix = dynamic_cast<const H264CapsFixup*>(nodes[i].get());
+    if (!fix) continue;
+
+    const auto names = nodes[i]->element_names(static_cast<int>(i));
+    if (names.empty()) continue;
+
+    GstElement* elem = gst_bin_get_by_name(GST_BIN(pipeline), names[0].c_str());
+    if (!elem) continue;
+
+    GstPad* src = gst_element_get_static_pad(elem, "src");
+    if (!src) {
+      gst_object_unref(elem);
+      continue;
+    }
+
+    const std::string rtsp_name = find_rtsp_input_name_for_fixup(nodes, i);
+    auto* ctx = make_h264_caps_fixup_ctx(pipeline, *fix, names[0], rtsp_name);
+    gst_pad_add_probe(
+        src,
+        static_cast<GstPadProbeType>(
+            GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM),
+        h264_caps_fixup_cb,
+        ctx,
+        +[](gpointer p) { delete reinterpret_cast<H264CapsFixupCtx*>(p); });
+
+    gst_object_unref(src);
+    gst_object_unref(elem);
+
+    const std::string upstream_caps = find_h264_capsfilter_name_for_fixup(nodes, i);
+    if (upstream_caps.empty() || upstream_caps == names[0]) continue;
+
+    GstElement* upstream_elem =
+        gst_bin_get_by_name(GST_BIN(pipeline), upstream_caps.c_str());
+    if (!upstream_elem) continue;
+
+    GstPad* upstream_src = gst_element_get_static_pad(upstream_elem, "src");
+    if (!upstream_src) {
+      gst_object_unref(upstream_elem);
+      continue;
+    }
+
+    auto* upstream_ctx =
+        make_h264_caps_fixup_ctx(pipeline, *fix, upstream_caps, rtsp_name);
+    gst_pad_add_probe(
+        upstream_src,
+        static_cast<GstPadProbeType>(
+            GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM),
+        h264_caps_fixup_cb,
+        upstream_ctx,
+        +[](gpointer p) { delete reinterpret_cast<H264CapsFixupCtx*>(p); });
+
+    gst_object_unref(upstream_src);
+    gst_object_unref(upstream_elem);
+  }
 }
 
 // =====================================================================================
@@ -1970,7 +2337,6 @@ PipelineSession::PipelineSession(PipelineSession&& other) noexcept {
   last_pipeline_ = std::move(other.last_pipeline_);
   guard_ = std::move(other.guard_);
   opt_ = other.opt_;
-  frame_cb_ = std::move(other.frame_cb_);
   tensor_cb_ = std::move(other.tensor_cb_);
   nodes_version_.store(other.nodes_version_.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
@@ -1985,7 +2351,6 @@ PipelineSession& PipelineSession::operator=(PipelineSession&& other) noexcept {
     last_pipeline_ = std::move(other.last_pipeline_);
     guard_ = std::move(other.guard_);
     opt_ = other.opt_;
-    frame_cb_ = std::move(other.frame_cb_);
     tensor_cb_ = std::move(other.tensor_cb_);
     nodes_version_.store(other.nodes_version_.load(std::memory_order_relaxed),
                          std::memory_order_relaxed);
@@ -2064,7 +2429,7 @@ void PipelineSession::set_guard(std::shared_ptr<void> guard) {
 }
 
 void PipelineSession::set_frame_callback(FrameCallback cb) {
-  frame_cb_ = std::move(cb);
+  set_tensor_callback(std::move(cb));
 }
 
 void PipelineSession::set_tensor_callback(TensorCallback cb) {
@@ -2111,33 +2476,10 @@ void PipelineSession::run() {
 
       const int timeout_ms = std::max(-1, opt_.callback_timeout_ms);
 
-      if (opt_.output_kind == PipelineOutputKind::Tensor) {
-        if (!tensor_cb_) {
-          gst_object_unref(sink);
-          stop_and_unref(pipeline);
-          throw std::runtime_error("PipelineSession::run: tensor callback not set");
-        }
-
-        TensorStream ts(pipeline, sink);
-        ts.set_debug_pipeline(last_pipeline_);
-        ts.set_diag(diag);
-        ts.set_guard(std::move(guard));
-
-        while (true) {
-          auto tensor = ts.next(timeout_ms);
-          if (!tensor.has_value()) {
-            if (gst_app_sink_is_eos(GST_APP_SINK(sink))) break;
-            continue;
-          }
-          if (!tensor_cb_(*tensor)) break;
-        }
-        return;
-      }
-
-      if (!frame_cb_) {
+      if (!tensor_cb_) {
         gst_object_unref(sink);
         stop_and_unref(pipeline);
-        throw std::runtime_error("PipelineSession::run: frame callback not set");
+        throw std::runtime_error("PipelineSession::run: tensor callback not set");
       }
 
       TensorStream ts(pipeline, sink);
@@ -2151,7 +2493,7 @@ void PipelineSession::run() {
           if (gst_app_sink_is_eos(GST_APP_SINK(sink))) break;
           continue;
         }
-        if (!frame_cb_(*tensor)) break;
+        if (!tensor_cb_(*tensor)) break;
       }
       return;
     } catch (const PipelineError& e) {
@@ -2208,6 +2550,7 @@ TensorStream PipelineSession::run_tensor() {
 
   attach_boundary_probes(pipeline, br.diag);
   attach_stage_timing_probes(pipeline, br.diag);
+  attach_h264_caps_fixups(pipeline, nodes_);
 
   GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
   if (!sink) {
@@ -2269,6 +2612,7 @@ TapStream PipelineSession::run_packet_stream() {
 
   attach_boundary_probes(pipeline, br.diag);
   attach_stage_timing_probes(pipeline, br.diag);
+  attach_h264_caps_fixups(pipeline, nodes_);
 
   GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
   if (!sink) {
@@ -2337,6 +2681,7 @@ PipelineRun PipelineSession::build(const PipelineRunOptions& opt) {
 
       attach_boundary_probes(pipeline, br.diag);
       attach_stage_timing_probes(pipeline, br.diag);
+      attach_h264_caps_fixups(pipeline, nodes_);
 
       GstElement* sink = nullptr;
       if (has_sink) {
@@ -3629,6 +3974,7 @@ RunDebugResult PipelineSession::run_debug(const RunDebugOptions& opt) {
 
         attach_boundary_probes(pipeline, br.diag);
         attach_stage_timing_probes(pipeline, br.diag);
+        attach_h264_caps_fixups(pipeline, nodes_);
 
         GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "mysink");
         if (!sink) {

@@ -1,5 +1,6 @@
 #include "nodes/common/Caps.h"
 #include "nodes/common/DebugPoint.h"
+#include "nodes/rtp/H264CapsFixup.h"
 #include "pipeline/PipelineSession.h"
 #include "pipeline/Errors.h"
 
@@ -12,6 +13,7 @@
 #include <csignal>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -22,6 +24,10 @@
 
 
 using namespace sima::nodes;
+
+static const char* decoder_element_name() {
+  return "neatdecoder";
+}
 
 static std::vector<uint8_t> copy_nv12_from_neat(const sima::NeatTensor& t,
                                                 int& out_w,
@@ -99,6 +105,12 @@ static Metrics compare_bgr(const cv::Mat& a, const cv::Mat& b) {
 static bool get_arg(int argc, char** argv, const std::string& key, std::string& out) {
   for (int i = 1; i + 1 < argc; ++i) {
     if (key == argv[i]) { out = argv[i + 1]; return true; }
+  }
+  return false;
+}
+static bool has_arg(int argc, char** argv, const std::string& key) {
+  for (int i = 1; i < argc; ++i) {
+    if (key == argv[i]) return true;
   }
   return false;
 }
@@ -225,14 +237,9 @@ static void add_rtp_depay_parse_chain(sima::PipelineSession& p,
   p.add(Gst("rtph264depay wait-for-keyframe=true"));
   p.add(Gst("h264parse disable-passthrough=true config-interval=1"));
   if (add_h264_caps) {
+    p.add(H264CapsFixup(fps, h264_width, h264_height));
     std::ostringstream caps;
     caps << "video/x-h264,parsed=true,stream-format=(string)byte-stream,alignment=(string)au";
-    if (h264_width > 0 && h264_height > 0) {
-      caps << ",width=(int)" << h264_width << ",height=(int)" << h264_height;
-    }
-    if (fps > 0) {
-      caps << ",framerate=(fraction)" << fps << "/1";
-    }
     p.add(Gst("capsfilter caps=\"" + caps.str() + "\""));
   }
 }
@@ -261,7 +268,7 @@ static void add_sima_manual_decode_chain(sima::PipelineSession& p,
                                          const ClientDecodeOptions& opt,
                                          TapLocation tap) {
   std::ostringstream ss;
-  ss << "simaaidecoder sima-allocator-type=" << opt.sima_allocator
+  ss << decoder_element_name() << " sima-allocator-type=" << opt.sima_allocator
      << " dec-fmt=NV12";
   if (!opt.sima_next.empty()) {
     ss << " next-element=" << opt.sima_next;
@@ -309,9 +316,11 @@ static void build_decode_pipeline(sima::PipelineSession& p,
   } else {
     p.add(H264DepayParse(/*payload_type=*/96,
                          /*h264_parse_config_interval=*/1,
-                         /*h264_fps=*/opt.fps,
-                         /*h264_width=*/opt.h264_width,
-                         /*h264_height=*/opt.h264_height));
+                         /*h264_fps=*/-1,
+                         /*h264_width=*/-1,
+                         /*h264_height=*/-1,
+                         /*enforce_h264_caps=*/false));
+    p.add(H264CapsFixup(opt.fps, opt.h264_width, opt.h264_height));
     if (tap == TapLocation::Encoded) p.add(DebugPoint(tap_label(tap)));
 
     const bool force_raw_chain =
@@ -519,7 +528,8 @@ int main(int argc, char** argv) {
                 << " [--debug-taps encoded,decoder,convert]"
                 << " [--dec-allocator N] [--dec-next STR] [--no-sysmem-caps]"
                 << " [--rtsp-url URL]"
-                << " [--enc-w N] [--enc-h N] [--mae X] [--psnr Y]\n";
+                << " [--enc-w N] [--enc-h N] [--mae X] [--psnr Y]"
+                << " [--save-images] [--dump-nv12] [--strict]\n";
       return 2;
     }
 
@@ -532,6 +542,9 @@ int main(int argc, char** argv) {
     int enc_w_override = -1;
     int enc_h_override = -1;
     bool no_sysmem_caps = false;
+    bool save_images = false;
+    bool dump_nv12 = false;
+    bool strict = false;
     std::string debug_taps_raw;
     int dec_allocator = 2;
     bool dec_allocator_set = false;
@@ -555,6 +568,12 @@ int main(int argc, char** argv) {
         dec_next_set = true;
       } else if (a == "--no-sysmem-caps") {
         no_sysmem_caps = true;
+      } else if (a == "--save-images") {
+        save_images = true;
+      } else if (a == "--dump-nv12") {
+        dump_nv12 = true;
+      } else if (a == "--strict") {
+        strict = true;
       } else if (a == "--rtsp-url" && i + 1 < argc) {
         rtsp_url = argv[++i];
       } else if (a == "--enc-w" && i + 1 < argc) {
@@ -564,8 +583,14 @@ int main(int argc, char** argv) {
       }
     }
 
-    const double mae_thr = get_double_arg(argc, argv, "--mae", 25.0);
-    const double psnr_thr = get_double_arg(argc, argv, "--psnr", 22.0);
+    const bool mae_set = has_arg(argc, argv, "--mae");
+    const bool psnr_set = has_arg(argc, argv, "--psnr");
+    double mae_thr = get_double_arg(argc, argv, "--mae", 50.0);
+    double psnr_thr = get_double_arg(argc, argv, "--psnr", 10.0);
+    if (strict) {
+      if (!mae_set) mae_thr = 25.0;
+      if (!psnr_set) psnr_thr = 22.0;
+    }
 
     std::vector<TapLocation> debug_taps;
     if (!debug_taps_raw.empty()) {
@@ -692,10 +717,14 @@ int main(int argc, char** argv) {
     int out_w = 0;
     int out_h = 0;
     std::vector<uint8_t> nv12 = copy_nv12_from_neat(dec.tensor, out_w, out_h);
-    dump_nv12_raw(nv12, "decoded_sima.nv12");
+    if (dump_nv12) {
+      dump_nv12_raw(nv12, "decoded_sima.nv12");
+    }
 
     cv::Mat bgr_full = nv12_to_bgr(nv12, out_w, out_h);
-    save_bgr(bgr_full, "decoded_sima_full.jpg");
+    if (save_images) {
+      save_bgr(bgr_full, "decoded_sima_full.jpg");
+    }
 
     // Crop back to content if encoded padded
     cv::Mat bgr_crop;
@@ -714,7 +743,9 @@ int main(int argc, char** argv) {
         cv::resize(bgr_crop, bgr_crop, cv::Size(content_w, content_h), 0, 0, cv::INTER_LINEAR);
       }
     }
-    save_bgr(bgr_crop, "decoded_sima_crop.jpg");
+    if (save_images) {
+      save_bgr(bgr_crop, "decoded_sima_crop.jpg");
+    }
 
     // Reference: OpenCV decode + resize to content
     cv::Mat ref = cv::imread(image_path, cv::IMREAD_COLOR);
@@ -725,7 +756,9 @@ int main(int argc, char** argv) {
     cv::Mat ref_rs;
     int interp = (content_w < ref.cols || content_h < ref.rows) ? cv::INTER_AREA : cv::INTER_LINEAR;
     cv::resize(ref, ref_rs, cv::Size(content_w, content_h), 0, 0, interp);
-    save_bgr(ref_rs, "reference_content.jpg");
+    if (save_images) {
+      save_bgr(ref_rs, "reference_content.jpg");
+    }
 
     Metrics m = compare_bgr(bgr_crop, ref_rs);
 

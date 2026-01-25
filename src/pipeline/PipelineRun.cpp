@@ -32,6 +32,7 @@ enum class InputKind {
   Mat,
   Neat,
   Holder,
+  Message,
 };
 
 struct InputItem {
@@ -39,6 +40,7 @@ struct InputItem {
   cv::Mat mat;
   NeatTensor neat;
   std::shared_ptr<void> holder;
+  RunOutput msg;
 };
 
 struct PipelineRun::State {
@@ -369,6 +371,9 @@ PipelineRun PipelineRun::create(InputStream stream,
           case InputKind::Holder:
             st->stream.push_holder(item.holder);
             break;
+          case InputKind::Message:
+            st->stream.push_message(item.msg);
+            break;
           case InputKind::Mat:
           default:
             st->stream.push(item.mat);
@@ -585,6 +590,52 @@ bool PipelineRun::push_holder_impl(const std::shared_ptr<void>& holder, bool blo
   return true;
 }
 
+bool PipelineRun::push_message_impl(const RunOutput& msg, bool block) {
+  if (!state_) {
+    throw std::runtime_error("PipelineRun::push: stream is closed");
+  }
+  if (!state_->supports_push) {
+    throw std::runtime_error(
+        "PipelineRun::push: pipeline has no InputAppSrc (push not supported)");
+  }
+  auto st = state_;
+  {
+    std::unique_lock<std::mutex> lock(st->in_mu);
+    if (st->input_closed) return false;
+    const int max = st->opt.input_queue;
+    if (st->opt.drop == DropPolicy::Block) {
+      if (!block) {
+        if (queue_full(st->in_queue, max)) return false;
+      } else {
+        st->in_cv.wait(lock, [&]() {
+          return st->stop_requested.load() || st->input_closed ||
+                 !queue_full(st->in_queue, max);
+        });
+      }
+    } else if (st->opt.drop == DropPolicy::DropNewest) {
+      if (queue_full(st->in_queue, max)) {
+        st->inputs_dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      }
+    } else if (st->opt.drop == DropPolicy::DropOldest) {
+      if (queue_full(st->in_queue, max)) {
+        st->in_queue.pop_front();
+        st->inputs_dropped.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
+    if (st->stop_requested.load() || st->input_closed) return false;
+
+    InputItem item;
+    item.kind = InputKind::Message;
+    item.msg = msg;
+    st->in_queue.push_back(std::move(item));
+    st->inputs_enqueued.fetch_add(1, std::memory_order_relaxed);
+  }
+  st->in_cv.notify_one();
+  return true;
+}
+
 bool PipelineRun::push(const cv::Mat& input) {
   return push_impl(input, true);
 }
@@ -609,6 +660,14 @@ bool PipelineRun::try_push_holder(const std::shared_ptr<void>& holder) {
   return push_holder_impl(holder, false);
 }
 
+bool PipelineRun::push(const RunOutput& msg) {
+  return push_message_impl(msg, true);
+}
+
+bool PipelineRun::try_push(const RunOutput& msg) {
+  return push_message_impl(msg, false);
+}
+
 void PipelineRun::close_input() {
   if (!state_) return;
   auto st = state_;
@@ -619,18 +678,20 @@ void PipelineRun::close_input() {
   st->in_cv.notify_all();
 }
 
-std::optional<RunInputResult> PipelineRun::pull(int timeout_ms) {
-  if (!state_) return std::nullopt;
+PullStatus PipelineRun::pull(int timeout_ms, RunOutput& out, PullError* err) {
+  if (!state_) return PullStatus::Closed;
   auto st = state_;
   if (!st->supports_pull) {
-    throw std::runtime_error(
-        "PipelineRun::pull: pipeline has no OutputAppSink (pull not supported)");
+    if (err) {
+      err->message = "PipelineRun::pull: pipeline has no OutputAppSink (pull not supported)";
+    }
+    return PullStatus::Error;
   }
   auto diag = st->stream.diag_ctx();
-  const auto handle_stream_error = [&](const std::string& err) {
+  const auto handle_stream_error = [&](const std::string& msg) {
     PipelineReport rep = diag ? diag->snapshot_basic() : PipelineReport{};
-    rep.repro_note = "PipelineRun::pull: " + err;
-    if (pipeline_internal::match_dispatcher_unavailable(err)) {
+    rep.repro_note = "PipelineRun::pull: " + msg;
+    if (pipeline_internal::match_dispatcher_unavailable(msg)) {
       rep.error_code = pipeline_internal::kDispatcherUnavailableError;
     }
     if (pipeline_internal::is_dispatcher_unavailable(rep)) {
@@ -643,12 +704,17 @@ std::optional<RunInputResult> PipelineRun::pull(int timeout_ms) {
         pipeline_internal::attempt_dispatcher_recovery(&rep, allow_recover);
       }
     }
-    throw PipelineError(rep.repro_note, std::move(rep));
+    if (err) {
+      err->message = rep.repro_note;
+      err->code = rep.error_code;
+      err->report = std::move(rep);
+    }
+    return PullStatus::Error;
   };
 
   const std::string early_err = last_error();
   if (!early_err.empty()) {
-    handle_stream_error(early_err);
+    return handle_stream_error(early_err);
   }
 
   auto done = [&]() {
@@ -671,17 +737,17 @@ std::optional<RunInputResult> PipelineRun::pull(int timeout_ms) {
     if (!st->out_cv.wait_for(lock, deadline, [&]() {
           return st->stop_requested.load() || !st->out_queue.empty() || done();
         })) {
-      throw std::runtime_error("PipelineRun::pull: timeout waiting for output");
+      return PullStatus::Timeout;
     }
   }
 
   if (!st->out_queue.empty()) {
-    RunInputResult out = std::move(st->out_queue.front());
+    out = std::move(st->out_queue.front());
     st->out_queue.pop_front();
     st->outputs_pulled.fetch_add(1, std::memory_order_relaxed);
     lock.unlock();
     st->out_cv.notify_one();
-    return out;
+    return PullStatus::Ok;
   }
 
   const bool is_done = done();
@@ -689,15 +755,93 @@ std::optional<RunInputResult> PipelineRun::pull(int timeout_ms) {
 
   const std::string late_err = last_error();
   if (!late_err.empty()) {
-    handle_stream_error(late_err);
+    return handle_stream_error(late_err);
   }
 
   if (is_done) {
     stop();
-    return std::nullopt;
+    return PullStatus::Closed;
   }
 
+  return PullStatus::Closed;
+}
+
+std::optional<RunInputResult> PipelineRun::pull(int timeout_ms) {
+  RunOutput out;
+  PullError err;
+  const PullStatus status = pull(timeout_ms, out, &err);
+  if (status == PullStatus::Ok) {
+    return out;
+  }
+  if (status == PullStatus::Error) {
+    if (err.report.has_value()) {
+      throw PipelineError(err.message, std::move(*err.report));
+    }
+    throw std::runtime_error(err.message.empty()
+                                 ? "PipelineRun::pull: error"
+                                 : err.message);
+  }
   return std::nullopt;
+}
+
+std::optional<NeatTensor> PipelineRun::pull_neat(int timeout_ms) {
+  RunOutput out;
+  PullError err;
+  const PullStatus status = pull(timeout_ms, out, &err);
+  if (status != PullStatus::Ok) return std::nullopt;
+  if (out.kind != RunOutputKind::Tensor || !out.neat.has_value()) {
+    return std::nullopt;
+  }
+  return out.neat;
+}
+
+NeatTensor PipelineRun::pull_neat_or_throw(int timeout_ms) {
+  RunOutput out;
+  PullError err;
+  const PullStatus status = pull(timeout_ms, out, &err);
+  if (status == PullStatus::Ok) {
+    if (out.kind == RunOutputKind::Tensor && out.neat.has_value()) {
+      return *out.neat;
+    }
+    throw std::runtime_error("PipelineRun::pull_neat_or_throw: output is not tensor");
+  }
+  if (status == PullStatus::Timeout) {
+    throw std::runtime_error("PipelineRun::pull_neat_or_throw: timeout");
+  }
+  if (status == PullStatus::Closed) {
+    throw std::runtime_error("PipelineRun::pull_neat_or_throw: closed");
+  }
+  if (err.report.has_value()) {
+    throw PipelineError(err.message, std::move(*err.report));
+  }
+  throw std::runtime_error(err.message.empty()
+                               ? "PipelineRun::pull_neat_or_throw: error"
+                               : err.message);
+}
+
+std::optional<NeatTensor> PipelineRun::pull_neat_matching(const std::string& payload_tag,
+                                                          int timeout_ms) {
+  const bool filter = !payload_tag.empty();
+  auto start = std::chrono::steady_clock::now();
+  while (true) {
+    RunOutput out;
+    PullError err;
+    int remaining = timeout_ms;
+    if (timeout_ms >= 0) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start).count();
+      remaining = static_cast<int>(timeout_ms - elapsed);
+      if (remaining < 0) remaining = 0;
+    }
+    const PullStatus status = pull(remaining, out, &err);
+    if (status != PullStatus::Ok) return std::nullopt;
+    if (out.kind != RunOutputKind::Tensor || !out.neat.has_value()) {
+      continue;
+    }
+    if (!filter || out.payload_tag == payload_tag) {
+      return out.neat;
+    }
+  }
 }
 
 RunInputResult PipelineRun::push_and_pull(const cv::Mat& input, int timeout_ms) {

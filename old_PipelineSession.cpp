@@ -1386,7 +1386,7 @@ H264EncodeSima::H264EncodeSima(int w, int h, int fps,
 
 std::string H264EncodeSima::gst_fragment(int node_index) const {
   std::ostringstream ss;
-  ss << "simaaiencoder name=n" << node_index << "_encoder "
+  ss << "neatencoder name=n" << node_index << "_encoder "
      << "enc-type=h264 "
      << "enc-profile=" << profile_ << " "
      << "enc-level=" << level_ << " "

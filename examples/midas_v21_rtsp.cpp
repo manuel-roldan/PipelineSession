@@ -162,16 +162,16 @@ float read_elem(const uint8_t* data, size_t idx, sima::TensorDType dtype) {
   return 0.0f;
 }
 
-bool depth_tensor_to_u8(const sima::FrameTensor& t,
+bool depth_tensor_to_u8(const sima::NeatTensor& t,
                         int fallback_w,
                         int fallback_h,
                         cv::Mat& depth_u8,
                         float* out_min,
                         float* out_max) {
-  if (t.planes.empty()) return false;
+  if (!t.is_dense()) return false;
 
-  int w = t.width > 0 ? t.width : fallback_w;
-  int h = t.height > 0 ? t.height : fallback_h;
+  int w = t.width() > 0 ? t.width() : fallback_w;
+  int h = t.height() > 0 ? t.height() : fallback_h;
   if ((w <= 0 || h <= 0) && t.shape.size() >= 2) {
     h = static_cast<int>(t.shape[0]);
     w = static_cast<int>(t.shape[1]);
@@ -186,9 +186,9 @@ bool depth_tensor_to_u8(const sima::FrameTensor& t,
   const size_t elem_size = dtype_bytes(t.dtype);
   const size_t needed = static_cast<size_t>(w) * static_cast<size_t>(h) *
                         static_cast<size_t>(depth) * elem_size;
-  if (t.planes[0].size() < needed) return false;
-
-  const uint8_t* data = t.planes[0].data();
+  std::vector<uint8_t> raw = t.copy_dense_bytes_tight();
+  if (raw.size() < needed) return false;
+  const uint8_t* data = raw.data();
   cv::Mat depth_f(h, w, CV_32FC1);
 
   float minv = std::numeric_limits<float>::infinity();
@@ -218,7 +218,7 @@ bool depth_tensor_to_u8(const sima::FrameTensor& t,
   return true;
 }
 
-bool tensor_to_depth_bgr(const sima::FrameTensor& t,
+bool tensor_to_depth_bgr(const sima::NeatTensor& t,
                          int fallback_w,
                          int fallback_h,
                          bool use_colormap,
@@ -238,14 +238,27 @@ bool tensor_to_depth_bgr(const sima::FrameTensor& t,
   return true;
 }
 
-bool tensor_ref_to_bgr(const sima::FrameTensorRef& t, cv::Mat& bgr_out) {
-  if (t.planes.empty()) return false;
-  if (t.format != "BGR") return false;
-  const auto& plane = t.planes[0];
-  const int stride = plane.stride > 0 ? plane.stride : t.width * 3;
-  bgr_out = cv::Mat(t.height, t.width, CV_8UC3,
-                    const_cast<uint8_t*>(plane.data),
-                    stride);
+bool tensor_to_bgr_mat(const sima::NeatTensor& t, cv::Mat& bgr_out) {
+  if (!t.is_dense()) return false;
+  if (t.dtype != sima::TensorDType::UInt8) return false;
+  if (!t.semantic.image.has_value() ||
+      t.semantic.image->format != sima::NeatImageSpec::PixelFormat::BGR) {
+    return false;
+  }
+  const int w = t.width();
+  const int h = t.height();
+  const int c = t.channels();
+  if (w <= 0 || h <= 0 || c != 3) return false;
+
+  sima::NeatMapping map = t.map_read();
+  if (!map.data) return false;
+  const int64_t stride = !t.strides_bytes.empty()
+                             ? t.strides_bytes[0]
+                             : static_cast<int64_t>(w) * c;
+  cv::Mat view(h, w, CV_8UC3,
+               const_cast<uint8_t*>(static_cast<const uint8_t*>(map.data)),
+               static_cast<size_t>(stride));
+  bgr_out = view.clone();
   return true;
 }
 
@@ -267,7 +280,7 @@ bool process_stream(simaai::ModelSession& session,
       frame = converted;
     }
 
-    sima::FrameTensor t = session.run_tensor(frame);
+    sima::NeatTensor t = session.run_tensor(frame);
 
     cv::Mat depth_bgr;
     float minv = 0.0f;
@@ -460,8 +473,8 @@ int main(int argc, char** argv) {
       auto ref_opt = ts.next(/*timeout_ms=*/2000);
       if (!ref_opt.has_value()) return false;
       cv::Mat view;
-      if (!tensor_ref_to_bgr(*ref_opt, view)) return false;
-      frame = view.clone();
+      if (!tensor_to_bgr_mat(*ref_opt, view)) return false;
+      frame = view;
       return true;
     };
 

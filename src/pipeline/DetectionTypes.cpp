@@ -25,30 +25,6 @@ std::string upper_copy(std::string s) {
   return s;
 }
 
-size_t dtype_bytes(TensorDType dtype) {
-  switch (dtype) {
-    case TensorDType::UInt8: return 1;
-    case TensorDType::Int8: return 1;
-    case TensorDType::UInt16: return 2;
-    case TensorDType::Int16: return 2;
-    case TensorDType::Int32: return 4;
-    case TensorDType::BFloat16: return 2;
-    case TensorDType::Float32: return 4;
-    case TensorDType::Float64: return 8;
-  }
-  return 1;
-}
-
-size_t neat_dense_bytes_tight(const NeatTensor& tensor) {
-  if (tensor.shape.empty()) return 0;
-  size_t total = dtype_bytes(tensor.dtype);
-  for (auto dim : tensor.shape) {
-    if (dim <= 0) return 0;
-    total *= static_cast<size_t>(dim);
-  }
-  return total;
-}
-
 } // namespace
 
 std::vector<Box> parse_bbox_bytes(const std::vector<uint8_t>& bytes,
@@ -130,22 +106,12 @@ BoxDecodeResult decode_bbox_tensor(const NeatTensor& tensor,
     throw std::runtime_error("bbox tensor format mismatch: " + fmt);
   }
 
-  const size_t bytes = neat_dense_bytes_tight(tensor);
-  NeatMapping mapping = tensor.map(NeatMapMode::Read);
-  if (!mapping.data) {
-    throw std::runtime_error("bbox tensor failed to map");
-  }
-  size_t take = bytes;
-  if (take == 0) {
-    take = mapping.size_bytes;
-  }
-  if (take > mapping.size_bytes) {
-    throw std::runtime_error("bbox tensor size exceeds mapped buffer");
-  }
-
   BoxDecodeResult out;
-  out.raw.resize(take);
-  std::memcpy(out.raw.data(), mapping.data, take);
+  try {
+    out.raw = tensor.copy_payload_bytes();
+  } catch (const std::exception& ex) {
+    throw std::runtime_error(std::string("bbox tensor copy failed: ") + ex.what());
+  }
   out.boxes = parse_bbox_bytes(out.raw, img_w, img_h, expected_topk, strict);
   return out;
 }

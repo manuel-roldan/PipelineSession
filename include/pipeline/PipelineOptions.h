@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -37,7 +38,6 @@ struct RunInputOptions {
 };
 
 enum class PipelineOutputKind {
-  Frame,
   Tensor,
 };
 
@@ -47,7 +47,7 @@ enum class PipelineRunMode {
 };
 
 struct PipelineSessionOptions {
-  PipelineOutputKind output_kind = PipelineOutputKind::Frame;
+  PipelineOutputKind output_kind = PipelineOutputKind::Tensor;
   int callback_timeout_ms = 1000;
   int throughput_depth = 8;
   // Insert queue2 between stages for async build(input) pipelines.
@@ -81,19 +81,58 @@ struct RunDebugTap {
 
 enum class RunOutputKind {
   Tensor,
+  Bundle,
   Unknown,
 };
 
-struct RunInputResult {
+enum class PullStatus {
+  Ok,
+  Timeout,
+  Closed,
+  Error,
+};
+
+struct PullError {
+  std::string message;
+  std::string code;
+  std::optional<PipelineReport> report;
+};
+
+struct RunOutput {
   RunOutputKind kind = RunOutputKind::Unknown;
   bool owned = true;
 
   std::optional<NeatTensor> neat;
+  std::vector<RunOutput> fields;
 
   std::string caps_string;
   std::string media_type;
-  std::string format;
+  std::string payload_tag;
+  std::string format; // Deprecated: use payload_tag.
+
+  int64_t frame_id = -1;
+  std::string stream_id;
+  std::string port_name;
+  int output_index = -1;
+  int64_t input_seq = -1;
 };
+
+inline RunOutput make_tensor_output(const std::string& port_name, NeatTensor tensor) {
+  RunOutput out;
+  out.kind = RunOutputKind::Tensor;
+  out.port_name = port_name;
+  out.neat = std::move(tensor);
+  return out;
+}
+
+inline RunOutput make_bundle_output(std::initializer_list<RunOutput> fields) {
+  RunOutput out;
+  out.kind = RunOutputKind::Bundle;
+  out.fields = fields;
+  return out;
+}
+
+using RunInputResult = RunOutput;
 
 struct RunDebugResult {
   std::optional<NeatTensor> first_frame;

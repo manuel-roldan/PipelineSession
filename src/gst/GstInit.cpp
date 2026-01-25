@@ -54,8 +54,14 @@ void gst_init_once() {
     if (meta_plugin) {
       gst_object_unref(meta_plugin);
     }
-    static const gchar* sima_meta_tags[] = {GST_META_TAG_MEMORY_STR, nullptr};
-    gst_meta_register_custom("GstSimaMeta", sima_meta_tags, nullptr, nullptr, nullptr);
+    if (!gst_meta_get_info("GstSimaMeta")) {
+      static const gchar* sima_meta_tags[] = {GST_META_TAG_MEMORY_STR, nullptr};
+      gst_meta_register_custom("GstSimaMeta", sima_meta_tags, nullptr, nullptr, nullptr);
+    }
+    if (!gst_meta_get_info("GstSimaSampleMeta")) {
+      static const gchar* sima_sample_tags[] = {GST_META_TAG_MEMORY_STR, nullptr};
+      gst_meta_register_custom("GstSimaSampleMeta", sima_sample_tags, nullptr, nullptr, nullptr);
+    }
 
     if (env_bool("SIMA_GST_SUPPRESS_JSON_WARNINGS", true)) {
       g_log_set_handler("Json",

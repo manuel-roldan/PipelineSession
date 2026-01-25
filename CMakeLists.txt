@@ -17,6 +17,7 @@ pkg_check_modules(GST REQUIRED
   gstreamer-1.0
   gstreamer-app-1.0
   gstreamer-video-1.0
+  gstreamer-sdp-1.0
   gstreamer-rtsp-server-1.0
   glib-2.0
 )
@@ -41,6 +42,7 @@ add_library(pipelinesession STATIC
   src/pipeline/NeatTensorImage.cpp
   src/pipeline/NeatTensorAdapters.cpp
   src/pipeline/NeatTensorConversion.cpp
+  src/pipeline/NeatTensorOpenCV.cpp
   src/pipeline/TensorStream.cpp
   src/pipeline/TensorUtil.cpp
   src/pipeline/TessellatedTensor.cpp
@@ -50,6 +52,8 @@ add_library(pipelinesession STATIC
   src/pipeline/internal/DispatcherRecovery.cpp
   src/pipeline/internal/InputStream.cpp
   src/pipeline/internal/InputStreamUtil.cpp
+  src/pipeline/internal/NeatTensorTransfer.cpp
+  src/pipeline/internal/SampleUtil.cpp
   src/pipeline/internal/SimaaiGuard.cpp
   src/mpk/ModelMPK.cpp
   src/ModelSession.cpp
@@ -74,6 +78,8 @@ add_library(pipelinesession STATIC
   src/nodes/io/RTSPInput.cpp
   src/nodes/io/AppSrcImage.cpp
   src/nodes/io/InputAppSrc.cpp
+  src/nodes/io/UdpSink.cpp
+  src/nodes/rtp/H264CapsFixup.cpp
   src/nodes/rtp/RtpH264Depay.cpp
   src/nodes/sima/H264DecodeSima.cpp
   src/nodes/sima/H264EncodeSima.cpp
@@ -88,6 +94,7 @@ add_library(pipelinesession STATIC
   src/nodes/groups/VideoInputGroup.cpp
   src/nodes/groups/RtspInputGroup.cpp
   src/nodes/groups/ModelGroups.cpp
+  src/nodes/groups/UdpSinkOutputGroup.cpp
 )
 
 target_include_directories(pipelinesession
@@ -148,6 +155,12 @@ target_include_directories(yolov8_multi_rtsp_demo PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/tests
 )
 
+add_executable(MultiCameraUDPYOLOv8
+  examples/MultiCameraUDPYOLOv8.cpp
+  examples/example_utils.cpp
+)
+target_link_libraries(MultiCameraUDPYOLOv8 PRIVATE pipelinesession)
+
 # -------------------------
 # Tests
 # -------------------------
@@ -204,9 +217,11 @@ target_link_libraries(unit_debug_overloads_test PRIVATE pipelinesession)
 add_executable(unit_tensorstream_test tests/unit_testing/unit_tensorstream_test.cpp)
 add_executable(unit_neattensor_core_test tests/unit_testing/unit_neattensor_core_test.cpp)
 add_executable(unit_neattensor_cvmat_test tests/unit_testing/unit_neattensor_cvmat_test.cpp)
+add_executable(neat_tensor_device_placement_test tests/neat_tensor_device_placement_test.cpp)
 target_link_libraries(unit_tensorstream_test PRIVATE pipelinesession)
 target_link_libraries(unit_neattensor_core_test PRIVATE pipelinesession)
 target_link_libraries(unit_neattensor_cvmat_test PRIVATE pipelinesession)
+target_link_libraries(neat_tensor_device_placement_test PRIVATE pipelinesession)
 
 add_executable(async_stream_test tests/e2e_testing/async_stream_test.cpp)
 target_link_libraries(async_stream_test PRIVATE pipelinesession)

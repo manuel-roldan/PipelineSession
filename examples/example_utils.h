@@ -1,9 +1,10 @@
 #pragma once
 
+#include "pipeline/NeatTensor.h"
 #include "pipeline/TensorStream.h"
-#include "pipeline/TensorTypes.h"
 
 #include <opencv2/core/mat.hpp>
+#include <opencv2/videoio.hpp>
 
 #include <filesystem>
 #include <string>
@@ -36,17 +37,31 @@ struct ScoredIndex {
   float prob = 0.0f;
 };
 
-std::vector<float> tensor_to_floats(const sima::FrameTensor& t);
-std::vector<float> scores_from_tensor(const sima::FrameTensor& t, const std::string& label);
+std::vector<float> tensor_to_floats(const sima::NeatTensor& t);
+std::vector<float> scores_from_tensor(const sima::NeatTensor& t, const std::string& label);
 std::vector<ScoredIndex> topk_with_softmax(const std::vector<float>& v, int k);
 void check_top1(const std::vector<float>& scores,
                 int expected_id,
                 float min_prob,
                 const std::string& label);
 
-sima::FrameTensor pull_tensor_with_retry(sima::TensorStream& ts,
-                                         const std::string& label,
-                                         int per_try_ms,
-                                         int tries);
+sima::NeatTensor pull_tensor_with_retry(sima::TensorStream& ts,
+                                        const std::string& label,
+                                        int per_try_ms,
+                                        int tries);
+
+std::string h264_gst_pipeline(const std::filesystem::path& out_path,
+                              int width,
+                              int height,
+                              double fps,
+                              int bitrate_kbps = 4000);
+
+bool open_h264_writer(cv::VideoWriter& writer,
+                      const std::filesystem::path& out_path,
+                      int width,
+                      int height,
+                      double fps,
+                      int bitrate_kbps = 4000,
+                      std::string* err = nullptr);
 
 } // namespace sima_examples

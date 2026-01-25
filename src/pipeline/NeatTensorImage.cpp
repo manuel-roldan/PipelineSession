@@ -140,8 +140,102 @@ std::optional<NeatNv12Mapped> NeatTensor::map_nv12_read() const {
   return out;
 }
 
+std::optional<NeatI420Mapped> NeatTensor::map_i420_read() const {
+  if (!is_i420()) return std::nullopt;
+  if (dtype != TensorDType::UInt8) {
+    throw std::runtime_error("map_i420_read: I420 requires UInt8 dtype");
+  }
+
+  const NeatPlane* y_plane = try_plane(NeatPlaneRole::Y);
+  const NeatPlane* u_plane = try_plane(NeatPlaneRole::U);
+  const NeatPlane* v_plane = try_plane(NeatPlaneRole::V);
+  if (!y_plane || !u_plane || !v_plane) {
+    throw std::runtime_error("map_i420_read: missing Y/U/V planes");
+  }
+
+  int w = width();
+  int h = height();
+  if (w <= 0) w = pick_width_from_planes(*this);
+  if (h <= 0) h = pick_height_from_planes(*this);
+  if (w <= 0 || h <= 0) {
+    throw std::runtime_error("map_i420_read: invalid dimensions");
+  }
+  if ((w % 2) != 0 || (h % 2) != 0) {
+    throw std::runtime_error("map_i420_read: I420 requires even dimensions");
+  }
+
+  if (y_plane->shape.size() >= 2) {
+    if (y_plane->shape[0] != h || y_plane->shape[1] != w) {
+      throw std::runtime_error("map_i420_read: Y plane shape mismatch");
+    }
+  }
+  if (u_plane->shape.size() >= 2) {
+    if (u_plane->shape[0] != h / 2 || u_plane->shape[1] != w / 2) {
+      throw std::runtime_error("map_i420_read: U plane shape mismatch");
+    }
+  }
+  if (v_plane->shape.size() >= 2) {
+    if (v_plane->shape[0] != h / 2 || v_plane->shape[1] != w / 2) {
+      throw std::runtime_error("map_i420_read: V plane shape mismatch");
+    }
+  }
+
+  const int64_t y_stride = !y_plane->strides_bytes.empty()
+      ? y_plane->strides_bytes[0]
+      : static_cast<int64_t>(w);
+  const int64_t uv_stride = !u_plane->strides_bytes.empty()
+      ? u_plane->strides_bytes[0]
+      : static_cast<int64_t>(w / 2);
+  const int64_t v_stride = !v_plane->strides_bytes.empty()
+      ? v_plane->strides_bytes[0]
+      : static_cast<int64_t>(w / 2);
+  if (y_stride < w || uv_stride < w / 2 || v_stride < w / 2) {
+    throw std::runtime_error("map_i420_read: invalid plane stride");
+  }
+
+  NeatMapping mapping = map_read();
+  if (!mapping.data) {
+    throw std::runtime_error("map_i420_read: mapping failed");
+  }
+
+  const std::size_t total = mapping.size_bytes;
+  const std::size_t y_end = static_cast<std::size_t>(y_plane->byte_offset) +
+      static_cast<std::size_t>(y_stride) * static_cast<std::size_t>(h - 1) +
+      static_cast<std::size_t>(w);
+  const std::size_t u_end = static_cast<std::size_t>(u_plane->byte_offset) +
+      static_cast<std::size_t>(uv_stride) * static_cast<std::size_t>(h / 2 - 1) +
+      static_cast<std::size_t>(w / 2);
+  const std::size_t v_end = static_cast<std::size_t>(v_plane->byte_offset) +
+      static_cast<std::size_t>(v_stride) * static_cast<std::size_t>(h / 2 - 1) +
+      static_cast<std::size_t>(w / 2);
+  if (total > 0 && (y_end > total || u_end > total || v_end > total)) {
+    throw std::runtime_error("map_i420_read: plane exceeds buffer bounds");
+  }
+
+  const uint8_t* base = static_cast<const uint8_t*>(mapping.data);
+  NeatI420Mapped out;
+  out.mapping = std::move(mapping);
+  out.view.width = w;
+  out.view.height = h;
+  out.view.y = base + y_plane->byte_offset;
+  out.view.y_stride = y_stride;
+  out.view.u = base + u_plane->byte_offset;
+  out.view.u_stride = uv_stride;
+  out.view.v = base + v_plane->byte_offset;
+  out.view.v_stride = v_stride;
+  return out;
+}
+
 std::size_t NeatTensor::nv12_required_bytes() const {
   if (!is_nv12()) return 0;
+  const int w = width();
+  const int h = height();
+  if (w <= 0 || h <= 0) return 0;
+  return static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3 / 2;
+}
+
+std::size_t NeatTensor::i420_required_bytes() const {
+  if (!is_i420()) return 0;
   const int w = width();
   const int h = height();
   if (w <= 0 || h <= 0) return 0;
@@ -185,6 +279,55 @@ std::vector<uint8_t> NeatTensor::copy_nv12_contiguous() const {
   std::vector<uint8_t> out(required);
   if (!copy_nv12_contiguous_to(out.data(), out.size())) {
     throw std::runtime_error("copy_nv12_contiguous: copy failed");
+  }
+  return out;
+}
+
+bool NeatTensor::copy_i420_contiguous_to(uint8_t* dst, std::size_t dst_size) const {
+  if (!dst) return false;
+  const std::size_t required = i420_required_bytes();
+  if (required == 0 || dst_size < required) return false;
+  auto mapped = map_i420_read();
+  if (!mapped.has_value()) return false;
+
+  const NeatI420View& view = mapped->view;
+  const int w = view.width;
+  const int h = view.height;
+  const int uv_w = w / 2;
+  const int uv_h = h / 2;
+
+  uint8_t* dst_y = dst;
+  for (int y = 0; y < h; ++y) {
+    std::memcpy(dst_y + static_cast<std::size_t>(y) * w,
+                view.y + static_cast<std::size_t>(y) * view.y_stride,
+                static_cast<std::size_t>(w));
+  }
+
+  uint8_t* dst_u = dst + static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  for (int y = 0; y < uv_h; ++y) {
+    std::memcpy(dst_u + static_cast<std::size_t>(y) * uv_w,
+                view.u + static_cast<std::size_t>(y) * view.u_stride,
+                static_cast<std::size_t>(uv_w));
+  }
+
+  uint8_t* dst_v = dst_u + static_cast<std::size_t>(uv_w) * static_cast<std::size_t>(uv_h);
+  for (int y = 0; y < uv_h; ++y) {
+    std::memcpy(dst_v + static_cast<std::size_t>(y) * uv_w,
+                view.v + static_cast<std::size_t>(y) * view.v_stride,
+                static_cast<std::size_t>(uv_w));
+  }
+
+  return true;
+}
+
+std::vector<uint8_t> NeatTensor::copy_i420_contiguous() const {
+  const std::size_t required = i420_required_bytes();
+  if (required == 0) {
+    throw std::runtime_error("copy_i420_contiguous: not an I420 tensor");
+  }
+  std::vector<uint8_t> out(required);
+  if (!copy_i420_contiguous_to(out.data(), out.size())) {
+    throw std::runtime_error("copy_i420_contiguous: copy failed");
   }
   return out;
 }

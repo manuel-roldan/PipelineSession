@@ -93,22 +93,23 @@ static cv::Mat load_rgb(const std::string& image_path) {
   return rgb;
 }
 
-static std::vector<float> tensor_to_floats(const sima::FrameTensor& t) {
+static std::vector<float> tensor_to_floats(const sima::NeatTensor& t) {
   if (t.dtype != sima::TensorDType::Float32) {
     throw std::runtime_error("Expected Float32 tensor output");
   }
-  if (t.planes.empty() || t.planes[0].empty()) {
+  std::vector<uint8_t> raw = t.copy_dense_bytes_tight();
+  if (raw.empty()) {
     throw std::runtime_error("Tensor output is empty");
   }
 
-  const size_t bytes = t.planes[0].size();
+  const size_t bytes = raw.size();
   if (bytes % sizeof(float) != 0) {
     throw std::runtime_error("Tensor plane size is not a multiple of float");
   }
 
   const size_t elems = bytes / sizeof(float);
   std::vector<float> out(elems);
-  std::memcpy(out.data(), t.planes[0].data(), elems * sizeof(float));
+  std::memcpy(out.data(), raw.data(), elems * sizeof(float));
   return out;
 }
 
@@ -144,15 +145,15 @@ static std::vector<ScoredIndex> topk_with_softmax(const std::vector<float>& v, i
   return out;
 }
 
-static sima::FrameTensor require_tensor(const sima::debug::DebugOutput& out,
-                                        const std::string& label) {
+static sima::NeatTensor require_tensor(const sima::debug::DebugOutput& out,
+                                       const std::string& label) {
   if (!out.tensor.has_value()) {
     throw std::runtime_error(label + ": expected tensor output");
   }
   return *out.tensor;
 }
 
-static std::vector<float> scores_from_tensor(const sima::FrameTensor& t,
+static std::vector<float> scores_from_tensor(const sima::NeatTensor& t,
                                              const std::string& label) {
   auto scores_full = tensor_to_floats(t);
   if (scores_full.empty()) {

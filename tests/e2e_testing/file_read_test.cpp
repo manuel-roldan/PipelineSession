@@ -158,8 +158,8 @@ static int run_image_once(const std::string& image_path,
     return 1;
   }
 
-  int out_w = 0;
-  int out_h = 0;
+  out_w = 0;
+  out_h = 0;
   std::vector<uint8_t> nv12 = copy_nv12_from_neat(captured, out_w, out_h);
 
   // Decode output -> BGR

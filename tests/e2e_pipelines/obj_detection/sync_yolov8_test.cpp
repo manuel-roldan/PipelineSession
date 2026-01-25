@@ -65,7 +65,7 @@ int env_int(const char* name, int def) {
   return std::atoi(val);
 }
 
-bool extract_bbox_payload(const sima::RunInputResult& result,
+bool extract_bbox_payload(const sima::RunOutput& result,
                           int iter,
                           std::vector<uint8_t>& payload,
                           std::string& err) {
@@ -75,7 +75,7 @@ bool extract_bbox_payload(const sima::RunInputResult& result,
   }
   if (result.neat.has_value()) {
     const auto& tensor = result.neat.value();
-    std::string fmt = result.format;
+    std::string fmt = result.payload_tag;
     if (fmt.empty() && tensor.semantic.tess.has_value()) {
       fmt = tensor.semantic.tess->format;
     }
@@ -84,40 +84,12 @@ bool extract_bbox_payload(const sima::RunInputResult& result,
             " format=" + fmt;
       return false;
     }
-    sima::NeatMapping mapping = tensor.map(sima::NeatMapMode::Read);
-    if (!mapping.data) {
-      err = "capture_missing_mapping iter=" + std::to_string(iter);
+    try {
+      payload = tensor.copy_payload_bytes();
+    } catch (const std::exception& ex) {
+      err = "capture_payload_failed iter=" + std::to_string(iter) + " err=" + ex.what();
       return false;
     }
-    size_t bytes = 0;
-    if (!tensor.shape.empty()) {
-      size_t elem = 1;
-      switch (tensor.dtype) {
-        case sima::TensorDType::UInt8: elem = 1; break;
-        case sima::TensorDType::Int8: elem = 1; break;
-        case sima::TensorDType::UInt16: elem = 2; break;
-        case sima::TensorDType::Int16: elem = 2; break;
-        case sima::TensorDType::Int32: elem = 4; break;
-        case sima::TensorDType::BFloat16: elem = 2; break;
-        case sima::TensorDType::Float32: elem = 4; break;
-        case sima::TensorDType::Float64: elem = 8; break;
-      }
-      bytes = elem;
-      for (auto dim : tensor.shape) {
-        if (dim <= 0) {
-          bytes = 0;
-          break;
-        }
-        bytes *= static_cast<size_t>(dim);
-      }
-    }
-    if (bytes == 0) bytes = mapping.size_bytes;
-    if (bytes > mapping.size_bytes) {
-      err = "capture_size_mismatch iter=" + std::to_string(iter);
-      return false;
-    }
-    payload.assign(static_cast<const uint8_t*>(mapping.data),
-                   static_cast<const uint8_t*>(mapping.data) + bytes);
   } else {
     err = "capture_missing_tensor iter=" + std::to_string(iter);
     return false;
@@ -207,7 +179,7 @@ RunSummary run_yolov8_sync(const fs::path& root,
   for (int i = 0; i < cfg.iters; ++i) {
     std::cout << "SYNC_YOLOV8 iter " << (i + 1) << "/" << cfg.iters << "\n";
     std::cout.flush();
-    sima::RunInputResult out;
+    sima::RunOutput out;
     try {
       step_log("sync: before run");
       out = p.run(img);

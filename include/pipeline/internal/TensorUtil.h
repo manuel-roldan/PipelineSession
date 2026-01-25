@@ -7,6 +7,8 @@ typedef struct _GstBuffer GstBuffer;
 
 namespace sima::pipeline_internal {
 
+std::shared_ptr<NeatStorage> make_gst_sample_storage(GstSample* sample);
+
 // Get a ref-counted GstBuffer from a tensor holder (e.g. GstSample holder).
 // The returned buffer must be unref'd if it is not pushed into appsrc.
 GstBuffer* buffer_from_tensor_holder(const std::shared_ptr<void>& holder);

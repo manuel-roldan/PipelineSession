@@ -66,8 +66,8 @@ private:
 
 class PipelineSession {
 public:
-  using FrameCallback = std::function<bool(const NeatTensor&)>;
   using TensorCallback = std::function<bool(const NeatTensor&)>;
+  using FrameCallback = TensorCallback;
 
   explicit PipelineSession(const PipelineSessionOptions& opt = {});
   ~PipelineSession();
@@ -134,6 +134,7 @@ public:
   void set_guard(std::shared_ptr<void> guard);
 
   // Output callbacks for source pipelines (used by run()).
+  SIMA_DEPRECATED("Use set_tensor_callback; frame callbacks are deprecated.")
   void set_frame_callback(FrameCallback cb);
   void set_tensor_callback(TensorCallback cb);
 
@@ -159,7 +160,6 @@ private:
   std::string last_pipeline_;
   std::shared_ptr<void> guard_;
   PipelineSessionOptions opt_{};
-  FrameCallback frame_cb_;
   TensorCallback tensor_cb_;
   std::atomic<uint64_t> nodes_version_{0};
   std::unique_ptr<BuiltState> built_;

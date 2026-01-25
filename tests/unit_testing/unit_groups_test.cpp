@@ -117,6 +117,9 @@ int main() {
     ro.latency_ms = 123;
     ro.tcp = true;
     ro.payload_type = 97;
+    ro.h264_fps = 30;
+    ro.h264_width = 640;
+    ro.h264_height = 480;
     ro.insert_queue = true;
     ro.debug.enable = true;
 
@@ -125,7 +128,11 @@ int main() {
     std::vector<std::shared_ptr<sima::Node>> manual_rtsp;
     manual_rtsp.push_back(sima::nodes::RTSPInput(ro.url, ro.latency_ms, ro.tcp));
     manual_rtsp.push_back(sima::nodes::Queue());
-    manual_rtsp.push_back(sima::nodes::H264DepayParse(ro.payload_type));
+    manual_rtsp.push_back(sima::nodes::H264DepayParse(ro.payload_type,
+                                                      ro.h264_parse_config_interval,
+                                                      ro.h264_fps,
+                                                      ro.h264_width,
+                                                      ro.h264_height));
     manual_rtsp.push_back(sima::nodes::DebugPoint(ro.debug.encoded_name));
     manual_rtsp.push_back(sima::nodes::Queue());
     manual_rtsp.push_back(sima::nodes::H264Decode(ro.sima_allocator_type,

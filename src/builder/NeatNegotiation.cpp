@@ -31,14 +31,66 @@ bool constraint_compatible(const NeatTensorConstraint& cur,
   if (!dtype_intersects(cur.dtypes, expected.dtypes)) return false;
   if (expected.rank >= 0 && cur.rank >= 0 && expected.rank != cur.rank) return false;
   if (!shape_compatible(cur.shape, expected.shape)) return false;
-  if (expected.device.has_value() && cur.device.has_value()) {
-    if (expected.device->type != cur.device->type ||
-        expected.device->id != cur.device->id) {
-      return false;
+  auto device_equal = [](const NeatDevice& a, const NeatDevice& b) {
+    return a.type == b.type && a.id == b.id;
+  };
+  auto device_allowed = [&](const NeatDevice& dev, const std::vector<NeatDevice>& allowed) {
+    if (allowed.empty()) return true;
+    for (const auto& candidate : allowed) {
+      if (device_equal(dev, candidate)) return true;
     }
+    return false;
+  };
+  if (expected.device.has_value() && cur.device.has_value()) {
+    if (!device_equal(*expected.device, *cur.device)) return false;
+  }
+  if (expected.device.has_value() && !cur.device.has_value()) {
+    if (!device_allowed(*expected.device, cur.allowed_devices)) return false;
+  }
+  if (cur.device.has_value() && !expected.device.has_value()) {
+    if (!device_allowed(*cur.device, expected.allowed_devices)) return false;
+  }
+  if (!cur.allowed_devices.empty() && !expected.allowed_devices.empty()) {
+    bool ok = false;
+    for (const auto& a : cur.allowed_devices) {
+      if (device_allowed(a, expected.allowed_devices)) {
+        ok = true;
+        break;
+      }
+    }
+    if (!ok) return false;
   }
   if (expected.image_format.has_value() && cur.image_format.has_value()) {
     if (expected.image_format != cur.image_format) return false;
+  }
+  if (!expected.required_segments.empty() && !cur.required_segments.empty()) {
+    if (expected.required_segments.size() != cur.required_segments.size()) return false;
+    for (size_t i = 0; i < expected.required_segments.size(); ++i) {
+      if (expected.required_segments[i].name != cur.required_segments[i].name) return false;
+      if (expected.required_segments[i].size_bytes != cur.required_segments[i].size_bytes) {
+        return false;
+      }
+    }
+  }
+  auto names_in_segments = [](const std::vector<std::string>& names,
+                              const std::vector<NeatSegment>& segments) {
+    for (const auto& name : names) {
+      bool found = false;
+      for (const auto& seg : segments) {
+        if (seg.name == name) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) return false;
+    }
+    return true;
+  };
+  if (!expected.required_segment_names.empty() && !cur.required_segments.empty()) {
+    if (!names_in_segments(expected.required_segment_names, cur.required_segments)) return false;
+  }
+  if (!cur.required_segment_names.empty() && !expected.required_segments.empty()) {
+    if (!names_in_segments(cur.required_segment_names, expected.required_segments)) return false;
   }
   return true;
 }

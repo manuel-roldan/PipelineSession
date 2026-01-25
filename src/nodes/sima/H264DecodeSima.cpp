@@ -1,5 +1,6 @@
 #include "nodes/sima/H264DecodeSima.h"
 
+#include "gst/GstHelpers.h"
 #include <memory>
 #include <sstream>
 #include <string>
@@ -25,10 +26,12 @@ std::string H264Decode::gst_fragment(int node_index) const {
       : decoder_name_;
   const std::string vc = "n" + std::to_string(node_index) + "_videoconvert";
   const std::string cap = "n" + std::to_string(node_index) + "_raw_caps";
+  require_neatdecoder("H264Decode::gst_fragment");
+  const char* element = "neatdecoder";
 
   if (raw_output_) {
     std::ostringstream ss;
-    ss << "simaaidecoder name=" << dec
+    ss << element << " name=" << dec
        << " sima-allocator-type=" << sima_allocator_type_;
     if (!decoder_name_.empty()) {
       ss << " op-buff-name=" << decoder_name_;
@@ -50,7 +53,7 @@ std::string H264Decode::gst_fragment(int node_index) const {
   caps << "video/x-raw(memory:SystemMemory),format=" << out_format_;
 
   std::ostringstream ss;
-  ss << "simaaidecoder name=" << dec
+  ss << element << " name=" << dec
      << " sima-allocator-type=" << sima_allocator_type_;
   if (!decoder_name_.empty()) {
     ss << " op-buff-name=" << decoder_name_;

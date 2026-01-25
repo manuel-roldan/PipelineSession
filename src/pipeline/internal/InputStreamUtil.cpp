@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -321,6 +322,15 @@ InputCapsConfig infer_input_caps(const InputAppSrcOptions& opt,
     out.bytes = neat_tensor_bytes_tight(input);
     if (out.bytes == 0) {
       throw std::invalid_argument("run(input): NeatTensor has invalid byte size");
+    }
+    return out;
+  }
+
+  if (out.media_type == "application/x-simaai.sample") {
+    out.format = "SAMPLE";
+    out.bytes = neat_tensor_bytes_tight(input);
+    if (out.bytes == 0) {
+      out.bytes = 1;
     }
     return out;
   }
@@ -755,13 +765,80 @@ void dump_sima_meta(GstBuffer* buffer, const char* label) {
 #endif
 }
 
+bool update_simaai_meta_fields(GstBuffer* buffer,
+                               const std::optional<int64_t>& frame_id_override,
+                               const std::optional<std::string>& stream_id_override,
+                               const std::optional<std::string>& buffer_name_override) {
+#if SIMA_HAS_SIMAAI_POOL
+  if (!buffer) return false;
+  GstCustomMeta* meta = gst_buffer_get_custom_meta(buffer, "GstSimaMeta");
+  if (!meta) return false;
+  GstStructure* s = gst_custom_meta_get_structure(meta);
+  if (!s) return false;
+  bool writable = true;
+#if defined(GST_STRUCTURE_IS_WRITABLE)
+  writable = GST_STRUCTURE_IS_WRITABLE(s);
+#else
+  writable = false;
+#endif
+  GstStructure* snapshot = nullptr;
+  if (!writable) {
+    if (!gst_buffer_is_writable(buffer)) {
+      return false;
+    }
+    snapshot = gst_structure_copy(s);
+    gst_buffer_remove_meta(buffer, &meta->meta);
+    meta = gst_buffer_add_custom_meta(buffer, "GstSimaMeta");
+    s = meta ? gst_custom_meta_get_structure(meta) : nullptr;
+    if (!s) {
+      if (snapshot) gst_structure_free(snapshot);
+      return false;
+    }
+    if (snapshot) {
+      const gint n_fields = gst_structure_n_fields(snapshot);
+      for (gint i = 0; i < n_fields; ++i) {
+        const char* fname = gst_structure_nth_field_name(snapshot, i);
+        if (!fname) continue;
+        const GValue* val = gst_structure_get_value(snapshot, fname);
+        if (!val) continue;
+        gst_structure_set_value(s, fname, val);
+      }
+      gst_structure_free(snapshot);
+    }
+  }
+  if (frame_id_override.has_value()) {
+    gst_structure_set(s, "frame-id", G_TYPE_INT64,
+                      static_cast<gint64>(*frame_id_override), nullptr);
+  }
+  if (stream_id_override.has_value()) {
+    gst_structure_set(s, "stream-id", G_TYPE_STRING,
+                      stream_id_override->c_str(), nullptr);
+  }
+  if (buffer_name_override.has_value()) {
+    gst_structure_set(s, "buffer-name", G_TYPE_STRING,
+                      buffer_name_override->c_str(), nullptr);
+  }
+  return true;
+#else
+  (void)buffer;
+  (void)frame_id_override;
+  (void)stream_id_override;
+  (void)buffer_name_override;
+  return false;
+#endif
+}
+
 GstBuffer* attach_simaai_meta_inplace(GstBuffer* buffer,
                                       const InputAppSrcOptions& opt,
                                       InputBufferPoolGuard& guard,
-                                      const char* label) {
+                                      const char* label,
+                                      const std::optional<int64_t>& frame_id_override,
+                                      const std::optional<std::string>& stream_id_override,
+                                      const std::optional<std::string>& buffer_name_override) {
 #if SIMA_HAS_SIMAAI_POOL
   if (!buffer) return nullptr;
-  const std::string name = opt.buffer_name.empty() ? "decoder" : opt.buffer_name;
+  const std::string name = buffer_name_override.value_or(
+      opt.buffer_name.empty() ? "decoder" : opt.buffer_name);
   dump_sima_meta(buffer, label);
 
   GstCustomMeta* meta = gst_buffer_get_custom_meta(buffer, "GstSimaMeta");
@@ -774,6 +851,14 @@ GstBuffer* attach_simaai_meta_inplace(GstBuffer* buffer,
 #endif
   if (meta && s && writable) {
     gst_structure_set(s, "buffer-name", G_TYPE_STRING, name.c_str(), nullptr);
+    if (frame_id_override.has_value()) {
+      gst_structure_set(s, "frame-id", G_TYPE_INT64,
+                        static_cast<gint64>(*frame_id_override), nullptr);
+    }
+    if (stream_id_override.has_value()) {
+      gst_structure_set(s, "stream-id", G_TYPE_STRING,
+                        stream_id_override->c_str(), nullptr);
+    }
     dump_sima_meta(buffer, label);
     return buffer;
   }
@@ -794,13 +879,16 @@ GstBuffer* attach_simaai_meta_inplace(GstBuffer* buffer,
   if (gst_buffer_n_memory(buffer) > 0) {
     phys_addr = gst_simaai_segment_memory_get_phys_addr(gst_buffer_peek_memory(buffer, 0));
   }
-  const gint64 frame_id = static_cast<gint64>(next_input_frame_id());
+  const gint64 frame_id = frame_id_override.has_value()
+      ? static_cast<gint64>(*frame_id_override)
+      : static_cast<gint64>(next_input_frame_id());
+  const std::string stream_id = stream_id_override.value_or("0");
   gst_structure_set(s,
                     "buffer-id", G_TYPE_INT64, phys_addr,
                     "buffer-name", G_TYPE_STRING, name.c_str(),
                     "buffer-offset", G_TYPE_INT64, static_cast<gint64>(0),
                     "frame-id", G_TYPE_INT64, frame_id,
-                    "stream-id", G_TYPE_STRING, "0",
+                    "stream-id", G_TYPE_STRING, stream_id.c_str(),
                     "timestamp", G_TYPE_UINT64, static_cast<guint64>(0),
                     nullptr);
   dump_sima_meta(buffer, label);

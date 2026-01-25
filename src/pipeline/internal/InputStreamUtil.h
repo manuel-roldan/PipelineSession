@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "pipeline/TensorTypes.h"
@@ -71,6 +72,13 @@ void dump_sima_meta(GstBuffer* buffer, const char* label);
 GstBuffer* attach_simaai_meta_inplace(GstBuffer* buffer,
                                       const InputAppSrcOptions& opt,
                                       InputBufferPoolGuard& guard,
-                                      const char* label);
+                                      const char* label,
+                                      const std::optional<int64_t>& frame_id_override = std::nullopt,
+                                      const std::optional<std::string>& stream_id_override = std::nullopt,
+                                      const std::optional<std::string>& buffer_name_override = std::nullopt);
+bool update_simaai_meta_fields(GstBuffer* buffer,
+                               const std::optional<int64_t>& frame_id_override,
+                               const std::optional<std::string>& stream_id_override,
+                               const std::optional<std::string>& buffer_name_override);
 
 } // namespace sima

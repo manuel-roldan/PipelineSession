@@ -1,9 +1,12 @@
 // src/pipeline/internal/InputStream.cpp
 #include "InputStream.h"
+
+#include "pipeline/PipelineOptions.h"
 #include "InputStreamUtil.h"
 
 #include "pipeline/internal/CapsBridge.h"
 #include "pipeline/internal/GstDiagnosticsUtil.h"
+#include "pipeline/internal/SampleUtil.h"
 #include "pipeline/internal/TensorUtil.h"
 #include "pipeline/NeatTensorAdapters.h"
 #include "sima/nodes/io/InputAppSrc.h"
@@ -21,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -70,7 +74,8 @@ void attach_required_meta(GstBuffer* buffer,
                           const InputAppSrcOptions& opt,
                           InputBufferPoolGuard& guard,
                           const char* where) {
-  if (!attach_simaai_meta_inplace(buffer, opt, guard, where)) {
+  if (!attach_simaai_meta_inplace(buffer, opt, guard, where,
+                                  std::nullopt, std::nullopt, std::nullopt)) {
     gst_buffer_unref(buffer);
     throw std::runtime_error(std::string(where) + ": failed to attach GstSimaMeta");
   }
@@ -78,7 +83,10 @@ void attach_required_meta(GstBuffer* buffer,
 
 bool InputStream::push_with_fill(
     const char* where,
-    const std::function<size_t(uint8_t*, size_t)>& fill) {
+    const std::function<size_t(uint8_t*, size_t)>& fill,
+    const std::optional<int64_t>& frame_id_override,
+    const std::optional<std::string>& stream_id_override,
+    const std::optional<std::string>& buffer_name_override) {
   auto st = state_;
   if (!st || !st->pipeline) {
     throw std::runtime_error(std::string(where) + ": stream is closed");
@@ -130,7 +138,13 @@ bool InputStream::push_with_fill(
   std::chrono::steady_clock::time_point t_copy_end{};
   if (timings) t_copy_end = std::chrono::steady_clock::now();
 
-  attach_required_meta(buf, st->src_opt, st->pool_guard, where);
+  if (!attach_simaai_meta_inplace(buf, st->src_opt, st->pool_guard, where,
+                                  frame_id_override,
+                                  stream_id_override,
+                                  buffer_name_override)) {
+    gst_buffer_unref(buf);
+    throw std::runtime_error(std::string(where) + ": failed to attach GstSimaMeta");
+  }
   GstBuffer* push_src = buf;
 
   std::chrono::steady_clock::time_point t_push_start{};
@@ -202,10 +216,122 @@ static std::string neat_format_name(const NeatTensor& t) {
   return "";
 }
 
-static RunInputResult output_from_sample_stream(GstSample* sample,
-                                                const char* where,
-                                                bool copy_output,
-                                                bool /*map_tensor_ref*/) {
+constexpr const char* kSampleMetaName = "GstSimaSampleMeta";
+
+bool sample_debug_enabled() {
+  return pipeline_internal::env_bool("SIMA_SAMPLE_DEBUG", false);
+}
+
+bool sample_bytes_enabled() {
+  return pipeline_internal::env_bool("SIMA_SAMPLE_BYTES", false);
+}
+
+bool flow_trace_enabled() {
+  return pipeline_internal::env_bool("SIMA_FLOW_TRACE", false);
+}
+
+size_t neat_tensor_bytes_tight(const NeatTensor& input);
+
+static std::optional<RunInputResult> bundle_from_sample_meta(GstSample* sample,
+                                                             const char* where,
+                                                             bool copy_output,
+                                                             bool map_tensor_ref);
+
+static std::string gst_time_to_string(GstClockTime t) {
+  if (!GST_CLOCK_TIME_IS_VALID(t)) {
+    return "none";
+  }
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%" GST_TIME_FORMAT, GST_TIME_ARGS(t));
+  return std::string(buf);
+}
+
+static void fill_output_meta_from_sample(GstSample* sample, RunInputResult* out) {
+  if (!sample || !out) return;
+  GstBuffer* buffer = gst_sample_get_buffer(sample);
+  if (!buffer) return;
+  GstCustomMeta* meta = gst_buffer_get_custom_meta(buffer, "GstSimaMeta");
+  GstStructure* s = meta ? gst_custom_meta_get_structure(meta) : nullptr;
+  if (!s) return;
+
+  gint64 frame_id = -1;
+  gint64 buffer_offset = -1;
+  gst_structure_get_int64(s, "frame-id", &frame_id);
+  gst_structure_get_int64(s, "buffer-offset", &buffer_offset);
+  const char* stream_id = gst_structure_get_string(s, "stream-id");
+  const char* buffer_name = gst_structure_get_string(s, "buffer-name");
+  if (frame_id >= 0) out->frame_id = frame_id;
+  if (stream_id) out->stream_id = stream_id;
+  if (buffer_name) out->port_name = buffer_name;
+  if (buffer_offset >= 0 && buffer_offset <= std::numeric_limits<int>::max()) {
+    out->output_index = static_cast<int>(buffer_offset);
+  }
+}
+
+static void log_sample_flow(const RunInputResult& out,
+                            GstSample* sample,
+                            const char* where,
+                            int bundle_fields = -1) {
+  if (!flow_trace_enabled()) return;
+
+  GstBuffer* buffer = sample ? gst_sample_get_buffer(sample) : nullptr;
+  const gsize size = buffer ? gst_buffer_get_size(buffer) : 0;
+  const GstClockTime pts = buffer ? GST_BUFFER_PTS(buffer) : GST_CLOCK_TIME_NONE;
+  const GstClockTime dts = buffer ? GST_BUFFER_DTS(buffer) : GST_CLOCK_TIME_NONE;
+  const GstClockTime dur = buffer ? GST_BUFFER_DURATION(buffer) : GST_CLOCK_TIME_NONE;
+  const guint flags = buffer ? GST_BUFFER_FLAGS(buffer) : 0;
+
+  const std::string pts_s = gst_time_to_string(pts);
+  const std::string dts_s = gst_time_to_string(dts);
+  const std::string dur_s = gst_time_to_string(dur);
+
+  const char* stream_id = out.stream_id.empty() ? "<none>" : out.stream_id.c_str();
+  const char* buffer_name = out.port_name.empty() ? "<none>" : out.port_name.c_str();
+  const char* caps = out.caps_string.empty() ? "<none>" : out.caps_string.c_str();
+  const char* media = out.media_type.empty() ? "<none>" : out.media_type.c_str();
+
+  if (bundle_fields >= 0) {
+    std::fprintf(stderr,
+                 "[FLOW] %s sample size=%" G_GSIZE_FORMAT
+                 " pts=%s dts=%s dur=%s flags=0x%x caps=%s media=%s frame_id=%"
+                 G_GINT64_FORMAT " stream_id=%s buffer_name=%s output_index=%d bundle_fields=%d\n",
+                 where,
+                 size,
+                 pts_s.c_str(),
+                 dts_s.c_str(),
+                 dur_s.c_str(),
+                 flags,
+                 caps,
+                 media,
+                 static_cast<gint64>(out.frame_id),
+                 stream_id,
+                 buffer_name,
+                 out.output_index,
+                 bundle_fields);
+  } else {
+    std::fprintf(stderr,
+                 "[FLOW] %s sample size=%" G_GSIZE_FORMAT
+                 " pts=%s dts=%s dur=%s flags=0x%x caps=%s media=%s frame_id=%"
+                 G_GINT64_FORMAT " stream_id=%s buffer_name=%s output_index=%d\n",
+                 where,
+                 size,
+                 pts_s.c_str(),
+                 dts_s.c_str(),
+                 dur_s.c_str(),
+                 flags,
+                 caps,
+                 media,
+                 static_cast<gint64>(out.frame_id),
+                 stream_id,
+                 buffer_name,
+                 out.output_index);
+  }
+}
+
+static RunInputResult output_from_sample_stream_inner(GstSample* sample,
+                                                      const char* where,
+                                                      bool copy_output,
+                                                      bool /*map_tensor_ref*/) {
   const auto normalize_format = [](const std::string& fmt) {
     std::string out;
     out.reserve(fmt.size());
@@ -224,6 +350,10 @@ static RunInputResult output_from_sample_stream(GstSample* sample,
 
   out.caps_string = pipeline_internal::gst_caps_to_string_safe(out_caps);
   out.media_type = media ? media : "";
+
+  fill_output_meta_from_sample(sample, &out);
+
+  log_sample_flow(out, sample, where);
 
   if (media && (std::string(media).rfind("video/x-raw", 0) == 0 ||
                 std::string(media) == "application/vnd.simaai.tensor")) {
@@ -244,7 +374,8 @@ static RunInputResult output_from_sample_stream(GstSample* sample,
                  neat.debug_string().c_str());
   }
   out.kind = RunOutputKind::Tensor;
-  out.format = normalize_format(neat_format_name(neat));
+  out.payload_tag = normalize_format(neat_format_name(neat));
+  out.format = out.payload_tag;
   if (copy_output) {
     out.neat = neat.clone();
     out.owned = true;
@@ -252,6 +383,164 @@ static RunInputResult output_from_sample_stream(GstSample* sample,
     out.neat = neat;
     out.owned = false;
   }
+  return out;
+}
+
+static RunInputResult output_from_sample_stream(GstSample* sample,
+                                                const char* where,
+                                                bool copy_output,
+                                                bool map_tensor_ref) {
+  if (auto bundle = bundle_from_sample_meta(sample, where, copy_output, map_tensor_ref)) {
+    return *bundle;
+  }
+  RunInputResult out =
+      output_from_sample_stream_inner(sample, where, copy_output, map_tensor_ref);
+  if (pipeline_internal::env_bool("SIMA_SAMPLE_FORCE_BUNDLE", false)) {
+    RunInputResult forced;
+    forced.kind = RunOutputKind::Bundle;
+    forced.owned = out.owned;
+    forced.frame_id = out.frame_id;
+    forced.stream_id = out.stream_id;
+    forced.fields.emplace_back(std::move(out));
+    if (sample_debug_enabled()) {
+      std::fprintf(stderr, "[SAMPLE] %s: forced bundle with 1 field\n", where);
+    }
+    return forced;
+  }
+  return out;
+}
+
+static std::optional<RunInputResult> bundle_from_sample_meta(GstSample* sample,
+                                                             const char* where,
+                                                             bool copy_output,
+                                                             bool map_tensor_ref) {
+  if (!sample) return std::nullopt;
+  GstBuffer* buffer = gst_sample_get_buffer(sample);
+  if (!buffer) return std::nullopt;
+  GstCustomMeta* meta = gst_buffer_get_custom_meta(buffer, kSampleMetaName);
+  GstStructure* s = meta ? gst_custom_meta_get_structure(meta) : nullptr;
+  if (!s) return std::nullopt;
+
+  const GValue* list_val = gst_structure_get_value(s, "fields");
+  if (!list_val || !GST_VALUE_HOLDS_LIST(list_val)) return std::nullopt;
+  const guint field_count = gst_value_list_get_size(list_val);
+
+  RunInputResult out;
+  out.kind = RunOutputKind::Bundle;
+  out.owned = copy_output;
+
+  GstCaps* out_caps = gst_sample_get_caps(sample);
+  const GstStructure* out_st = out_caps ? gst_caps_get_structure(out_caps, 0) : nullptr;
+  const char* media = out_st ? gst_structure_get_name(out_st) : nullptr;
+  out.caps_string = pipeline_internal::gst_caps_to_string_safe(out_caps);
+  out.media_type = media ? media : "";
+  fill_output_meta_from_sample(sample, &out);
+
+  log_sample_flow(out, sample, where, static_cast<int>(field_count));
+
+  if (sample_debug_enabled()) {
+    std::fprintf(stderr, "[SAMPLE] %s: bundle meta fields=%u\n", where, field_count);
+  }
+
+  out.fields.reserve(field_count);
+  for (guint i = 0; i < field_count; ++i) {
+    const GValue* entry_val = gst_value_list_get_value(list_val, i);
+    if (!entry_val || !GST_VALUE_HOLDS_STRUCTURE(entry_val)) {
+      if (sample_debug_enabled()) {
+        std::fprintf(stderr, "[SAMPLE] %s: field[%u] invalid entry\n", where, i);
+      }
+      continue;
+    }
+    const GstStructure* entry = static_cast<const GstStructure*>(g_value_get_boxed(entry_val));
+    if (!entry) continue;
+
+    const char* field_name = gst_structure_get_string(entry, "name");
+    const char* buffer_name = gst_structure_get_string(entry, "buffer-name");
+    const char* caps_str = gst_structure_get_string(entry, "caps");
+
+    const GValue* buf_val = gst_structure_get_value(entry, "buffer");
+    if (!buf_val || !GST_VALUE_HOLDS_BUFFER(buf_val)) {
+      if (sample_debug_enabled()) {
+        std::fprintf(stderr, "[SAMPLE] %s: field[%u] missing buffer\n", where, i);
+      }
+      continue;
+    }
+    GstBuffer* field_buf = gst_value_get_buffer(buf_val);
+    if (!field_buf) continue;
+
+    GstCaps* field_caps = nullptr;
+    if (caps_str && *caps_str) {
+      field_caps = gst_caps_from_string(caps_str);
+    }
+    if (!field_caps) {
+      field_caps = gst_sample_get_caps(sample);
+      if (field_caps) gst_caps_ref(field_caps);
+    }
+    if (!field_caps) {
+      if (sample_debug_enabled()) {
+        std::fprintf(stderr, "[SAMPLE] %s: field[%u] missing caps\n", where, i);
+      }
+      continue;
+    }
+
+    GstSample* field_sample = gst_sample_new(field_buf, field_caps, nullptr, nullptr);
+    gst_caps_unref(field_caps);
+    if (!field_sample) continue;
+
+    RunInputResult field_out =
+        output_from_sample_stream_inner(field_sample, where, copy_output, map_tensor_ref);
+    gst_sample_unref(field_sample);
+
+    if (field_name && *field_name) {
+      field_out.port_name = field_name;
+    } else if (buffer_name && *buffer_name) {
+      field_out.port_name = buffer_name;
+    }
+
+    if (out.frame_id < 0 && field_out.frame_id >= 0) {
+      out.frame_id = field_out.frame_id;
+    }
+    if (out.stream_id.empty() && !field_out.stream_id.empty()) {
+      out.stream_id = field_out.stream_id;
+    }
+
+    if (sample_debug_enabled() || sample_bytes_enabled()) {
+      const char* name = field_out.port_name.empty() ? "field" : field_out.port_name.c_str();
+      if (sample_debug_enabled()) {
+        std::fprintf(stderr,
+                     "[SAMPLE] %s: field[%u] name=%s caps=%s\n",
+                     where,
+                     i,
+                     name,
+                     field_out.caps_string.empty() ? "<none>" : field_out.caps_string.c_str());
+      }
+      if (sample_bytes_enabled()) {
+        const size_t buf_bytes = static_cast<size_t>(gst_buffer_get_size(field_buf));
+        size_t tensor_bytes = 0;
+        if (field_out.neat.has_value()) {
+          tensor_bytes = neat_tensor_bytes_tight(*field_out.neat);
+        }
+        std::fprintf(stderr,
+                     "[SAMPLE] %s: field[%u] name=%s buffer-bytes=%zu tensor-bytes=%zu copy=%s\n",
+                     where,
+                     i,
+                     name,
+                     buf_bytes,
+                     tensor_bytes,
+                     copy_output ? "true" : "false");
+      }
+    }
+
+    out.fields.emplace_back(std::move(field_out));
+  }
+
+  if (out.fields.empty()) {
+    if (sample_debug_enabled()) {
+      std::fprintf(stderr, "[SAMPLE] %s: bundle meta had no valid fields\n", where);
+    }
+    return std::nullopt;
+  }
+
   return out;
 }
 
@@ -577,7 +866,10 @@ bool InputStream::try_push(const cv::Mat& input) {
                             std::memcpy(dst, contiguous.data, copy_bytes);
                           }
                           return copy_bytes;
-                        });
+                        },
+                        std::nullopt,
+                        std::nullopt,
+                        std::nullopt);
 }
 
 void InputStream::push(const NeatTensor& input) {
@@ -636,7 +928,110 @@ bool InputStream::try_push(const NeatTensor& input) {
                           }
                           std::memcpy(dst, base + base_offset, copy_bytes);
                           return copy_bytes;
-                        });
+                        },
+                        std::nullopt,
+                        std::nullopt,
+                        std::nullopt);
+}
+
+void InputStream::push_message(const RunOutput& msg) {
+  if (!try_push_message(msg)) {
+    throw std::runtime_error("InputStream::push_message: appsrc push failed");
+  }
+}
+
+bool InputStream::try_push_message(const RunOutput& msg) {
+  if (!state_ || !state_->pipeline) {
+    throw std::runtime_error("InputStream::try_push_message: stream is closed");
+  }
+  if (!state_->appsrc) {
+    throw std::runtime_error(
+        "InputStream::try_push_message: appsrc not available (no InputAppSrc)");
+  }
+
+  if (msg.kind == RunOutputKind::Bundle) {
+    std::string err;
+    auto holder = pipeline_internal::make_sample_holder_from_bundle(msg, &err);
+    if (!holder) {
+      throw std::runtime_error(err.empty()
+                                   ? "InputStream::try_push_message: bundle to sample failed"
+                                   : err);
+    }
+    return try_push_holder(holder);
+  }
+
+  if (msg.kind != RunOutputKind::Tensor || !msg.neat.has_value()) {
+    throw std::runtime_error("InputStream::try_push_message: missing tensor");
+  }
+
+  const NeatTensor& input = *msg.neat;
+  if (input.storage && input.storage->holder) {
+    GstBuffer* buf = pipeline_internal::buffer_from_tensor_holder(input.storage->holder);
+    if (!buf) {
+      throw std::runtime_error("InputStream::try_push_message: missing GstBuffer");
+    }
+    update_simaai_meta_fields(buf,
+                              msg.frame_id >= 0 ? std::optional<int64_t>(msg.frame_id) : std::nullopt,
+                              msg.stream_id.empty() ? std::nullopt : std::optional<std::string>(msg.stream_id),
+                              msg.port_name.empty() ? std::nullopt : std::optional<std::string>(msg.port_name));
+    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(state_->appsrc), buf);
+    if (ret != GST_FLOW_OK) {
+      gst_buffer_unref(buf);
+      return false;
+    }
+    return true;
+  }
+
+  if (!state_->opt.allow_mismatched_input) {
+    validate_input_matches_caps(state_->cfg, state_->src_opt, input, "InputStream::try_push_message");
+  } else if (!input.storage) {
+    throw std::invalid_argument("InputStream::try_push_message: NeatTensor missing storage");
+  }
+
+  const size_t input_bytes = neat_tensor_bytes_tight(input);
+  return push_with_fill("InputStream::try_push_message",
+                        [&](uint8_t* dst, size_t dst_bytes) -> size_t {
+                          const size_t copy_bytes = std::min(input_bytes, dst_bytes);
+                          if (!input.storage || copy_bytes == 0) return 0;
+
+                          NeatMapping mapping = input.map(NeatMapMode::Read);
+                          if (!mapping.data) {
+                            throw std::runtime_error("InputStream::try_push_message: map failed");
+                          }
+                          const uint8_t* base = static_cast<const uint8_t*>(mapping.data);
+
+                          if (input.is_composite()) {
+                            size_t offset = 0;
+                            for (const auto& plane : input.planes) {
+                              if (offset >= copy_bytes) break;
+                              const size_t plane_bytes =
+                                  neat_plane_bytes_tight(plane, input.dtype);
+                              const size_t remaining = copy_bytes - offset;
+                              const size_t take = std::min(plane_bytes, remaining);
+                              if (take == 0) continue;
+                              const size_t plane_offset =
+                                  static_cast<size_t>(plane.byte_offset);
+                              if (plane_offset + take > mapping.size_bytes) {
+                                throw std::runtime_error(
+                                    "InputStream::try_push_message: NeatTensor plane out of range");
+                              }
+                              std::memcpy(dst + offset, base + plane_offset, take);
+                              offset += take;
+                            }
+                            return offset;
+                          }
+
+                          const size_t base_offset = static_cast<size_t>(input.byte_offset);
+                          if (base_offset + copy_bytes > mapping.size_bytes) {
+                            throw std::runtime_error(
+                                "InputStream::try_push_message: NeatTensor buffer out of range");
+                          }
+                          std::memcpy(dst, base + base_offset, copy_bytes);
+                          return copy_bytes;
+                        },
+                        msg.frame_id >= 0 ? std::optional<int64_t>(msg.frame_id) : std::nullopt,
+                        msg.stream_id.empty() ? std::nullopt : std::optional<std::string>(msg.stream_id),
+                        msg.port_name.empty() ? std::nullopt : std::optional<std::string>(msg.port_name));
 }
 
 void InputStream::push_holder(const std::shared_ptr<void>& holder) {
